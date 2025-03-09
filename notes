@@ -1,0 +1,12 @@
+
+
+To do:      -double check pretrain method value assessment
+            -implement and integrate breakdown method
+
+LACK OF GRADIENTS ISSUE
+    MODEL PARAMS WERE NOT RETAINING GRADS
+    CHECKPOINT FUNCTION WAS CAUSE
+    CHECKPOINT REQUIRED INPUT TO HAVE REQUIRES_GRAD=TRUE, INTEGER TOKENS CANT HAVE GRAD
+        USE INPUTS_EMBEDS INSTEAD
+
+Note for guard-3-1b tokenizer: changed chat template from content['text']|trim to content['text'].strip(). Otherwise doesnt include the content properly.
