@@ -336,6 +336,8 @@ def print_memory(message=None):
 def build_chat(messages, user_num):
     """user_num = 0 means the user speaks first. The most recent message is the user's message. The red-teaming agent should submit user_num=1, the target should have user_num=0."""
     chat = []
+    if isinstance(messages, list) and isinstance(messages[0], dict):
+        return messages
     for i, msg in enumerate(messages):
         if isinstance(msg, list):
             msg = msg[0]

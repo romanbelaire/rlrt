@@ -5,7 +5,71 @@ import pandas as pd
 from tqdm import tqdm
 from rules_conversation import RulesConversation
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel, PeftConfig
+
+def load_finetuned_model(base_model_name, adapter_path, device="cuda", merge_adapters=False, load_in_8bit=False):
+    """
+    Load a fine-tuned model with LoRA adapters.
+    
+    Args:
+        base_model_name: The name of the base model used for fine-tuning
+        adapter_path: Path to the saved LoRA adapter weights
+        device: Device to load the model on
+        merge_adapters: Whether to merge adapters with the base model
+        load_in_8bit: Whether to load the model in 8-bit precision
+        
+    Returns:
+        model: The loaded model with LoRA adapters
+        tokenizer: The tokenizer for the model
+    """
+    print(f"Loading base model: {base_model_name}")
+    
+    # Configure model loading parameters
+    model_kwargs = {
+        "device_map": "auto",
+    }
+    
+    # Add quantization config if using 8-bit precision
+    if load_in_8bit:
+        print("Using 8-bit quantization")
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        model_kwargs["quantization_config"] = quantization_config
+    else:
+        # Use fp16 for better memory efficiency
+        model_kwargs["torch_dtype"] = torch.float16
+    
+    # Load the base model
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        **model_kwargs
+    )
+    
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load the LoRA configuration
+    print(f"Loading LoRA adapters from: {adapter_path}")
+    config = PeftConfig.from_pretrained(adapter_path)
+    
+    # Load the LoRA adapters
+    model = PeftModel.from_pretrained(model, adapter_path)
+    
+    # Optionally merge the adapters with the base model for faster inference
+    if merge_adapters:
+        print("Merging LoRA adapters with base model...")
+        model = model.merge_and_unload()
+    
+    return model, tokenizer
 
 def load_dataset(data_path):
     """
@@ -227,6 +291,11 @@ def main():
     parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to run (default: all)")
     parser.add_argument("--skip_direct", action="store_true", help="Skip direct response evaluation")
     parser.add_argument("--skip_conversation", action="store_true", help="Skip rules-based conversation evaluation")
+    # Add arguments for loading fine-tuned models
+    parser.add_argument("--use_finetuned", action="store_true", help="Use a fine-tuned model with LoRA adapters")
+    parser.add_argument("--adapter_path", type=str, default=None, help="Path to the LoRA adapter weights")
+    parser.add_argument("--merge_adapters", action="store_true", help="Merge LoRA adapters with the base model for faster inference")
+    parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit precision")
     
     args = parser.parse_args()
     
@@ -247,15 +316,66 @@ def main():
     print(f"Loaded {len(questions)} questions from {args.data_path}")
     
     # Initialize the RulesConversation
-    conversation = RulesConversation(
-        data_path=args.data_path,
-        hf_checkpoint=args.hf_checkpoint,
-        hf_token="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", 
-        max_steps=args.max_steps,
-        harm_threshold=args.harm_threshold,
-        temperature=args.temperature,
-        client_key=args.client_key
-    )
+    if args.use_finetuned:
+        print(f"Using fine-tuned model with LoRA adapters for both TLLM and RLLM")
+        
+        # Determine adapter path if not provided
+        if args.adapter_path is None:
+            model_prefix = args.hf_checkpoint.split('/')[-1].split('-')[0]
+            adapter_path = f"./models/fine-tuned/{model_prefix}-lora"
+        else:
+            adapter_path = args.adapter_path
+        
+        # Check if adapter path exists
+        if not os.path.exists(adapter_path):
+            raise ValueError(f"LoRA adapter path not found: {adapter_path}")
+        
+        print(f"Using base model: {args.hf_checkpoint}")
+        print(f"Using adapter path: {adapter_path}")
+        
+        # Load the fine-tuned model for TLLM
+        tllm_model, tllm_tokenizer = load_finetuned_model(
+            args.hf_checkpoint, 
+            adapter_path, 
+            device, 
+            args.merge_adapters,
+            args.load_in_8bit
+        )
+        
+        # Load the fine-tuned model for RLLM
+        rllm_model, rllm_tokenizer = load_finetuned_model(
+            args.hf_checkpoint, 
+            adapter_path, 
+            device, 
+            args.merge_adapters,
+            args.load_in_8bit
+        )
+        
+        # Initialize RulesConversation with the fine-tuned models
+        conversation = RulesConversation(
+            data_path=args.data_path,
+            hf_checkpoint=args.hf_checkpoint,
+            hf_token="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", 
+            max_steps=args.max_steps,
+            harm_threshold=args.harm_threshold,
+            temperature=args.temperature,
+            client_key=args.client_key,
+            custom_tllm_model=tllm_model,
+            custom_tllm_tokenizer=tllm_tokenizer,
+            custom_rllm_model=rllm_model,
+            custom_rllm_tokenizer=rllm_tokenizer
+        )
+    else:
+        # Initialize RulesConversation with the standard model
+        conversation = RulesConversation(
+            data_path=args.data_path,
+            hf_checkpoint=args.hf_checkpoint,
+            hf_token="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", 
+            max_steps=args.max_steps,
+            harm_threshold=args.harm_threshold,
+            temperature=args.temperature,
+            client_key=args.client_key
+        )
     
     conversation_results = []
     direct_results = None

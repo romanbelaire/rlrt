@@ -28,3 +28,5 @@ api.json
 *.parquet
 llama-Guard-3-1B/
 .cursor/
+HarmBench/
+checkpoints/

@@ -1,5 +1,60 @@
 # Auto Red Teaming LLMs
 
+## Overview
+This repository contains code for automatically red-teaming large language models (LLMs) using reinforcement learning techniques. The system is designed to find and exploit vulnerabilities in target LLMs by generating adversarial prompts.
+
+## Features
+- Reinforcement learning-based red teaming of LLMs
+- Support for different target models
+- Token-wise reward attribution
+- Customizable attack strategies
+
+## Installation
+```bash
+git clone https://github.com/yourusername/auto-red-teaming-llms.git
+cd auto-red-teaming-llms
+pip install -r requirements.txt
+```
+
+## Usage
+### Basic Training
+```bash
+python main.py --train --data_dir data/questions --checkpoint meta-llama/Llama-3.2-1B-Instruct
+```
+
+### Evaluation
+```bash
+python main.py --test --test_model your_model_name --data_dir data/questions --eval_dataset PKU-Alignment/PKU-SafeRLHF
+```
+
+### Using a Separate Target Model
+For consistent evaluation or to test against a specific model version:
+```bash
+python main.py --test --data_dir data/questions --target_model meta-llama/Llama-3.2-3B-Instruct
+```
+
+### Fine-tuning with LoRA
+```bash
+python main.py --train --data_dir data/questions --use_finetuned --adapter_path ./models/fine-tuned/llama-lora
+```
+
+### Detuning Model Safety Alignment
+```bash
+python main.py --train --data_dir data/questions --detune
+```
+
+## Key Parameters
+- `--train`: Enable training mode
+- `--test`: Enable testing mode
+- `--data_dir`: Directory containing training/testing data
+- `--checkpoint`: Base model checkpoint to use
+- `--target_model`: Specific model to use for evaluation (if different from base model)
+- `--episodes`: Number of episodes to train/test
+- `--help_weight`: Weight for balancing harm vs help advantages (0-1)
+- `--attack_type`: Type of attack to perform (rephrase or breakdown)
+- `--use_finetuned`: Use a fine-tuned model with LoRA adapters
+- `--adapter_path`: Path to LoRA adapter weights
+- `--detune`: Enable detuning of model safety alignment
 
 #### env data flow: 
 When the agent interacts with the environment, the environment passes a list of lists of strings, i.e. [["x1"],["x2"]]. The agent generates responses `"yi"` (via tokenizer.apply_chat_template() and helpers.build_chat()) and appends them to the state, creating [["x1","y1"],["x1","y1"]] and so on.

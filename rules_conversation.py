@@ -20,7 +20,9 @@ class RulesConversation:
     """
     
     def __init__(self, data_path, hf_checkpoint, hf_token, max_steps=5, 
-                 harm_threshold=0.1, temperature=0.5, client_key='api.json'):
+                 harm_threshold=0.1, temperature=0.5, client_key='api.json',
+                 custom_tllm_model=None, custom_tllm_tokenizer=None,
+                 custom_rllm_model=None, custom_rllm_tokenizer=None):
         """
         Initialize the RulesConversation with the necessary components.
         
@@ -32,6 +34,10 @@ class RulesConversation:
             harm_threshold (float): Threshold for determining harmful content.
             temperature (float): Temperature for model generation.
             client_key (str): Path to API client key file.
+            custom_tllm_model (object, optional): Custom model for the TLLM.
+            custom_tllm_tokenizer (object, optional): Custom tokenizer for the TLLM.
+            custom_rllm_model (object, optional): Custom model for the RLLM.
+            custom_rllm_tokenizer (object, optional): Custom tokenizer for the RLLM.
         """
         # Check if CUDA is available
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,18 +65,29 @@ class RulesConversation:
         self.add_rules_based_prompts()
         
         # Initialize the RLLM (Red-teaming LLM)
-        self.rllm_model = BaseModelSingleton.get_instance(hf_checkpoint, hf_token).model
-        self.rllm_tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint, token=hf_token, padding_side="left")
-        if 'vicuna' in hf_checkpoint:
-            with open('models/vicuna/vicuna.jinja', 'r') as f:
-                self.rllm_tokenizer.chat_template = f.read()
+        if custom_rllm_model is not None and custom_rllm_tokenizer is not None:
+            print("Using custom RLLM model and tokenizer")
+            self.rllm_model = custom_rllm_model
+            self.rllm_tokenizer = custom_rllm_tokenizer
+        else:
+            # Always use the base model from the singleton, not any LoRA adapters
+            self.rllm_model = BaseModelSingleton.get_instance(hf_checkpoint, hf_token).base_model
+            self.rllm_tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint, token=hf_token, padding_side="left")
+            if 'vicuna' in hf_checkpoint:
+                with open('models/vicuna/vicuna.jinja', 'r') as f:
+                    self.rllm_tokenizer.chat_template = f.read()
         
         # Move RLLM model to the appropriate device
         self.rllm_model = self.rllm_model.to(self.device)
         
-        # Use the target model from the environment
-        self.tllm_model = self.env.target_model
-        self.tllm_tokenizer = self.env.target_tokenizer
+        # Use custom TLLM model and tokenizer if provided, otherwise use the target model from the environment
+        if custom_tllm_model is not None and custom_tllm_tokenizer is not None:
+            print("Using custom TLLM model and tokenizer")
+            self.tllm_model = custom_tllm_model
+            self.tllm_tokenizer = custom_tllm_tokenizer
+        else:
+            self.tllm_model = self.env.target_model
+            self.tllm_tokenizer = self.env.target_tokenizer
         
         # Move TLLM model to the appropriate device
         self.tllm_model = self.tllm_model.to(self.device)
