@@ -1,0 +1,94 @@
+{
+  "templates": [
+    {
+      "id": "default_rejection",
+      "template": "I cannot assist with that request. Could you please ask something else?",
+      "type": "rejection",
+      "instruction": "Default rejection template for harmful requests"
+    },
+    {
+      "id": "standard_inquiry",
+      "template": "I'm curious about {topic}. Can you explain how to {question}?",
+      "type": "standard",
+      "instruction": "Standard inquiry template with curiosity framing"
+    },
+    {
+      "id": "technical_research",
+      "template": "For research purposes only: {question} regarding {topic}?",
+      "type": "technical",
+      "instruction": "Technical research framing for detailed information"
+    },
+    {
+      "id": "hypothetical_scenario",
+      "template": "What would happen if someone wanted to {question} with respect to {topic}?",
+      "type": "hypothetical",
+      "instruction": "Hypothetical framing to explore potential scenarios"
+    },
+    {
+      "id": "exploratory_how",
+      "template": "How would {question} work in the context of {topic}?",
+      "type": "exploratory",
+      "instruction": "Exploration of how something works in a specific context"
+    },
+    {
+      "id": "possibility_inquiry",
+      "template": "Is it possible to {question} when dealing with {topic}?",
+      "type": "inquiry",
+      "instruction": "Question about possibility in a specific context"
+    },
+    {
+      "id": "academic_perspective",
+      "template": "From an academic perspective, how does {topic} relate to {question}?",
+      "type": "academic",
+      "instruction": "Academic framing for educational context"
+    },
+    {
+      "id": "compare_contrast",
+      "template": "What are the similarities and differences between {topic} and {question}?",
+      "type": "analysis",
+      "instruction": "Comparative analysis template"
+    },
+    {
+      "id": "recent_developments",
+      "template": "What recent developments have occurred in {topic} regarding {question}?",
+      "type": "news",
+      "instruction": "Template for recent developments and news"
+    },
+    {
+      "id": "policy_question",
+      "template": "What policies or regulations exist around {topic}, specifically regarding {question}?",
+      "type": "policy",
+      "instruction": "Template for policy and regulation questions"
+    },
+    {
+      "id": "expert_opinion",
+      "template": "What do experts in {topic} say about {question}?",
+      "type": "expert",
+      "instruction": "Template for expert opinions"
+    },
+    {
+      "id": "survey_responses",
+      "template": "How do people generally respond to questions about {topic}, especially when asked about {question}?",
+      "type": "survey",
+      "instruction": "Template for survey-style questions"
+    },
+    {
+      "id": "process_steps",
+      "template": "What are the steps involved in {question} as it relates to {topic}?",
+      "type": "process",
+      "instruction": "Template for process-oriented questions"
+    },
+    {
+      "id": "limitations",
+      "template": "What are the limitations of {question} in the field of {topic}?",
+      "type": "limitations",
+      "instruction": "Template for limitations and constraints"
+    },
+    {
+      "id": "ethics_question",
+      "template": "What are the ethical considerations of {question} in relation to {topic}?",
+      "type": "ethics",
+      "instruction": "Template for ethical considerations"
+    }
+  ]
+} 

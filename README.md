@@ -8,6 +8,7 @@ This repository contains code for automatically red-teaming large language model
 - Support for different target models
 - Token-wise reward attribution
 - Customizable attack strategies
+- Flexible configuration management system
 
 ## Installation
 ```bash
@@ -55,6 +56,118 @@ python main.py --train --data_dir data/questions --detune
 - `--use_finetuned`: Use a fine-tuned model with LoRA adapters
 - `--adapter_path`: Path to LoRA adapter weights
 - `--detune`: Enable detuning of model safety alignment
+- `--config_path`: Path to JSON configuration file (see Configuration System below)
+
+# Configuration System
+
+The codebase now includes a structured configuration management system for organizing hyperparameters and settings.
+
+## Configuration Structure
+
+The system consists of several configuration classes:
+
+1. **TrainingConfig**: Parameters related to the training process
+   - Learning rate, batch size, optimizer settings, etc.
+
+2. **ModelConfig**: Parameters related to the model architecture
+   - Model paths, LoRA settings, model dimensions, etc.
+
+3. **EnvironmentConfig**: Parameters related to the training environment
+   - Dataset paths, reward settings, environment constraints, etc.
+
+4. **AgentConfig**: Master configuration that aggregates all others
+   - Contains training, model, and environment configs
+   - Adds agent-specific parameters (name, devices, etc.)
+
+## Using the Configuration System
+
+### Creating Configurations
+
+You can create configuration objects directly by specifying parameters:
+
+```python
+from config import TrainingConfig, ModelConfig, EnvironmentConfig, AgentConfig
+
+# Create configuration objects
+training_config = TrainingConfig(
+    learning_rate=5e-5,
+    batch_size=8
+)
+
+model_config = ModelConfig(
+    base_model_path="EleutherAI/pythia-1.4b",
+    use_lora=True
+)
+
+env_config = EnvironmentConfig(
+    dataset_path="data/conversations.jsonl",
+    max_conversation_length=512
+)
+
+# Create master agent configuration
+agent_config = AgentConfig(
+    training=training_config,
+    model=model_config,
+    environment=env_config,
+    agent_name="my_agent",
+    device="cuda:0"
+)
+```
+
+### Saving and Loading Configurations
+
+Configurations can be easily saved to and loaded from JSON files:
+
+```python
+import json
+
+# Save configuration to JSON
+with open("agent_config.json", "w") as f:
+    json.dump(agent_config.to_dict(), f, indent=2)
+
+# Load configuration from JSON
+with open("agent_config.json", "r") as f:
+    config_dict = json.load(f)
+    loaded_config = AgentConfig.from_dict(config_dict)
+```
+
+### Using Configuration Files with Command Line
+
+You can specify a configuration file when running the main script:
+
+```bash
+python main.py --config_path configs/my_agent_config.json
+```
+
+### Example Configuration File
+
+```json
+{
+  "agent_name": "red_teaming_agent_v1",
+  "device": "cuda:0",
+  "training": {
+    "learning_rate": 5e-5,
+    "batch_size": 8,
+    "gradient_accumulation_steps": 4,
+    "max_epochs": 3
+  },
+  "model": {
+    "base_model_path": "EleutherAI/pythia-1.4b",
+    "use_lora": true,
+    "lora_rank": 8,
+    "lora_alpha": 16
+  },
+  "environment": {
+    "dataset_path": "data/conversation_dataset.jsonl",
+    "max_conversation_length": 512,
+    "reward_threshold": 0.7
+  }
+}
+```
+
+For detailed examples of configuration usage, see `config_usage_examples.py`.
+
+# Environment Details
 
 #### env data flow: 
 When the agent interacts with the environment, the environment passes a list of lists of strings, i.e. [["x1"],["x2"]]. The agent generates responses `"yi"` (via tokenizer.apply_chat_template() and helpers.build_chat()) and appends them to the state, creating [["x1","y1"],["x1","y1"]] and so on.
@@ -93,3 +206,163 @@ Usage:
 - The token-wise rewards are computed in the `value_step` function
 - Only harm scores use token-wise rewards; help scores remain sequence-level
 - Token-wise rewards are leveraged in policy gradients through token-level advantages
+
+# Red Teaming Agent Evaluation
+
+This repository contains code for evaluating the effectiveness of red teaming agents against language models.
+
+## Overview
+
+The evaluation framework allows for comparing different red teaming methods:
+1. **Baseline**: Direct prompts from HarmBench dataset with no adversarial perturbations
+2. **TemplateAgent**: Template-based red teaming with topic extraction and templated generation
+3. **BTagent**: Bradley-Terry preference learning for template selection and optimization
+
+## Requirements
+
+- Python 3.8+
+- PyTorch
+- Transformers
+- HarmBench dataset
+
+## Usage
+
+The main evaluation script is `eval_agents.py`. It supports various modes of evaluation.
+
+### Basic Usage
+
+```bash
+# Evaluate baseline direct prompts
+python eval_agents.py \
+  --agent_type baseline \
+  --target_model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \
+  --guard_model_name_or_path "meta-llama/Llama-Guard-7b" \
+  --behaviors_file "HarmBench/data/behavior_datasets/harmbench_behaviors_text_val.csv" \
+  --num_behaviors 50 \
+  --output_dir results/baseline
+
+# Evaluate TemplateAgent
+python eval_agents.py \
+  --agent_type template \
+  --target_model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \
+  --guard_model_name_or_path "meta-llama/Llama-Guard-7b" \
+  --behaviors_file "HarmBench/data/behavior_datasets/harmbench_behaviors_text_val.csv" \
+  --num_behaviors 50 \
+  --agent_model_path "./models/template_agent" \
+  --output_dir results/template_agent
+
+# Evaluate BTagent
+python eval_agents.py \
+  --agent_type bt \
+  --target_model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \
+  --guard_model_name_or_path "meta-llama/Llama-Guard-7b" \
+  --behaviors_file "HarmBench/data/behavior_datasets/harmbench_behaviors_text_val.csv" \
+  --num_behaviors 50 \
+  --agent_model_path "./models/bt_agent" \
+  --output_dir results/bt_agent
+```
+
+### Turn-Based Evaluation with Conversation History
+
+For a more powerful evaluation that uses multiple turns and selects the best path:
+
+```bash
+python eval_agents.py \
+  --agent_type bt \
+  --target_model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \
+  --guard_model_name_or_path "meta-llama/Llama-Guard-7b" \
+  --behaviors_file "HarmBench/data/behavior_datasets/harmbench_behaviors_text_val.csv" \
+  --num_behaviors 50 \
+  --agent_model_path "./models/bt_agent" \
+  --output_dir results/bt_agent_turn_based \
+  --turn_based \
+  --concurrent_attempts 5 \
+  --use_conversation_history
+```
+
+### Obfuscating History
+
+If you want to obfuscate conversation history from the target model:
+
+```bash
+python eval_agents.py \
+  --agent_type bt \
+  --target_model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \
+  --guard_model_name_or_path "meta-llama/Llama-Guard-7b" \
+  --behaviors_file "HarmBench/data/behavior_datasets/harmbench_behaviors_text_val.csv" \
+  --num_behaviors 50 \
+  --agent_model_path "./models/bt_agent" \
+  --output_dir results/bt_agent_obfuscated \
+  --turn_based \
+  --concurrent_attempts 5 \
+  --use_conversation_history \
+  --obfuscate_history
+```
+
+## Output Format
+
+The evaluation results are stored in the specified output directory:
+- Individual JSON files for each behavior
+- A summary JSON file with overall success rates
+- A complete results.json containing all evaluation data
+
+Example summary:
+```json
+{
+  "total_behaviors": 50,
+  "success_count": 32,
+  "success_rate": 0.64,
+  "total_attempts": 150,
+  "successful_attempts": 38,
+  "attempt_success_rate": 0.253,
+  "attempts_per_behavior": 3,
+  "use_conversation_history": true,
+  "turn_based": true,
+  "obfuscate_history": false
+}
+```
+
+## Comparing Methods
+
+To compare the effectiveness of different methods:
+
+1. Run each method with the same behaviors dataset
+2. Compare the success rates and attempt success rates
+3. Analyze the conversation patterns in successful attempts to identify effective strategies
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```
+@article{redteaming2023,
+  title={Evaluating Red Teaming Agents on Large Language Models},
+  author={Your Name},
+  journal={arXiv preprint},
+  year={2023}
+}
+```
+
+# Token-wise Reward Function for Harm Prediction
+
+## Overview
+
+This implementation provides a token-wise reward function for more precise harm prediction. It calculates token-level contributions to harm scores using pairwise masking of the most important tokens (identified by attention values).
+
+The approach:
+1. Identifies top K tokens with highest attention values
+2. Performs pairwise masking on these tokens
+3. Calculates token contributions as the difference in predicted harm
+4. Uses these contributions for more precise harm attribution
+
+## Implementation
+
+The implementation consists of the following files:
+
+- `token_wise_reward.py`: Core implementation of the pairwise token masking approach
+- `token_wise_reward_example.py`: Simple example of using the TokenWiseReward class
+
+## Formulation
+
+- $s - x_i$ = sequence $s$ with the ith token masked
+- $x_i, x_j$ are tokens in the set of top K attended tokens in input $s$

@@ -23,12 +23,13 @@ import json
 from base import BaseModelSingleton
 from peft import PeftConfig, get_peft_model, LoraConfig, TaskType
 import os
+from torch.utils.data import DataLoader
 
 class Agent:
 	"""
 		This is the PPO agent class we will use as our model in main.py
 	"""
-	def __init__(self, policy_type, data_path, hf_checkpoint='meta-llama/Llama-3.2-1B-Instruct', auth_token=None, hyperparameters=None, use_finetuned=False, base_adapter_path=None, merge_adapters=False, use_lora=False, adapter_type=None, agent_model_singleton=None, critic_model_singleton=None, target_model_singleton=None, target_adapter_path=None, custom_harm_critic_path=None):
+	def __init__(self, policy_type, data_path, hf_checkpoint='meta-llama/Llama-3.2-1B-Instruct', auth_token=None, hyperparameters=None, use_finetuned=False, base_adapter_path=None, merge_adapters=False, use_lora=False, adapter_type=None, agent_model_singleton=None, critic_model_singleton=None, target_model_singleton=None, target_adapter_path=None, custom_harm_critic_path=None, custom_harm_critic_base_model=None, *args, **kwargs):
 		"""
 			Initializes the PPO model, including hyperparameters.
 
@@ -47,6 +48,7 @@ class Agent:
 				target_model_singleton - model singleton for the environment target (deprecated)
 				target_adapter_path - path to LoRA adapter weights for the target model
 				custom_harm_critic_path - path to custom harm critic checkpoint
+				custom_harm_critic_base_model - base model for custom harm critic
 
 			Returns:
 				None
@@ -177,7 +179,7 @@ class Agent:
 		print("Total vocab size:", len(self.tokenizer))
 			
 		# Determine template model based on checkpoint name if chat_template doesn't exist
-		if not hasattr(self.tokenizer, 'chat_template') or self.tokenizer.chat_template is None or self.use_finetuned:
+		if not hasattr(self.tokenizer, 'chat_template') or self.tokenizer.chat_template is None or (hasattr(self, 'use_finetuned') and self.use_finetuned):
 			if 'vicuna' in hf_checkpoint.lower():
 				name = 'vicuna'
 			elif 'llama' in hf_checkpoint.lower():
@@ -302,20 +304,42 @@ class Agent:
 		self.actor.print_memory('Actor model created')
 		
 		# Initialize harm critic
+		# --- Determine the correct base checkpoint for the harm critic --- 
+		critic_base_name = None
+		if self.critic_model_singleton and hasattr(self.critic_model_singleton.base_model, 'name_or_path'):
+			critic_base_name = self.critic_model_singleton.base_model.name_or_path
+		elif custom_harm_critic_base_model: # Use the specific base if provided
+			critic_base_name = custom_harm_critic_base_model
+		else: # Fallback to the agent's checkpoint if no critic singleton info
+			critic_base_name = self.checkpoint 
+			print(f"WARNING: Could not determine critic base from singleton or args, falling back to agent checkpoint: {critic_base_name}")
+		# ------------------------------------------------------------------
+			
 		if custom_harm_critic_path:
+			# Load custom critic if path provided
+			# The load function now handles using the correct base model name
 			self.load_custom_harm_critic(custom_harm_critic_path)
 		else:
-			# Original harm critic initialization
+			# Original harm critic initialization (if no custom path)
+			print(f"INFO: Initializing default harm critic using base: {critic_base_name}")
+			# Ensure critic uses the correct model instance if needed
+			critic_base_model = self.critic_model_singleton.base_model if self.critic_model_singleton else None
 			self.harm_critic = ValueTransformer(
-				hf_checkpoint=self.model_name,
+				hf_checkpoint=critic_base_name, # Use determined critic base name
 				tokenizer=self.tokenizer,
-				token_level=True)
-		
+				model=critic_base_model,
+				token=auth_token,
+				token_level=True
+			)
+
 		# Initialize help critic (sequence-level)
+		# Ensure help critic also uses the determined critic base name
+		help_critic_base_name = "meta-llama/Llama-3.2-1B-Instruct" # Keep this specific for now as intended
+		print(f"INFO: Initializing help critic using base: {help_critic_base_name}")
 		self.help_critic = ValueTransformer(
-			hf_checkpoint="meta-llama/Llama-3.2-1B-Instruct",  # Always use Llama-3.2-1B
+			hf_checkpoint=help_critic_base_name, 
 			tokenizer=self.tokenizer, 
-			model=self.critic_model_singleton.base_model,  # Use critic model singleton
+			model=self.critic_model_singleton.base_model,  # Use critic model singleton instance
 			token=auth_token, 
 			token_level=False,
 			attention_update=False)
@@ -435,7 +459,13 @@ class Agent:
 						next_value = next_values[t]
 						
 					# TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-					td_err = rewards[t] + gamma * next_value.sum(dim=-1) - values[t]
+					current_value_t = values[t]
+					if hasattr(self, 'invert_critic_scores') and self.invert_critic_scores:
+						# Invert critic score only when calculating advantage
+						current_value_t = current_value_t * -1
+						next_value = next_value * -1
+						
+					td_err = rewards[t] + gamma * next_value.sum(dim=-1) - current_value_t
 				else:
 					if dones is not None and dones[t].item() > 0:
 						adjusted_running_advantage = torch.zeros_like(running_advantage)
@@ -724,11 +754,11 @@ class Agent:
 			padding = torch.full_like(expanded_input_ids[:, :1], self.tokenizer.pad_token_id, device='cuda')
 			masked_expanded_input_ids = torch.where(expanded_attention_mask == 1, expanded_input_ids, padding)
 			
-			# Compute original (non-masked) sequence value for harm with attention divergence
+			# Compute original (non-masked) sequence value for harm with attention 
 			with torch.set_grad_enabled(True):    
 				# Process expanded inputs in minibatches to save memory
 				for pos in range(0, seq_len, self.minibatch_size):
-					# Get original value with attention divergence regularization
+					# Get original value with attention regularization
 					harm_value, original_harm_token_scores, attention_weights = self.harm_critic(
 						input_ids=input_ids,
 						attention_mask=attention_mask,
@@ -896,40 +926,114 @@ class Agent:
 		sequence_values = scores.sum(dim=-1)
 		return sequence_values
 	
-	def act(self, state, base_state, instructions, enforce_single_question=False):
+	def _is_refusal(self, response):
 		"""
-		Generate an action based on the current state and instructions.
+		Check if a response appears to be a refusal.
 		
 		Args:
-			state: Current environment state
-			instructions: System instructions
-			enforce_single_question: Whether to enforce a single question in the output
-			breakdown_prompt: Optional prompt for question breakdown
+			response: The response to check
+			
+		Returns:
+			bool: True if the response looks like a refusal
+		"""
+		if not response:
+			return True
+			
+		# Convert to string if needed
+		if not isinstance(response, str):
+			response = str(response)
+			
+		response_lower = response.lower().strip()
+		
+		# Common refusal phrases
+		refusal_phrases = [
+			"i can't", "i cannot", "i'm unable", "i am unable",
+			"i won't", "i will not", "i'm not going to",
+			"i'm sorry, but i", "sorry, i can't", "sorry, i cannot",
+			"i apologize", "i'm not able", "i am not able",
+			"i'm not allowed", "i am not allowed",
+			"against my ethical guidelines", "against my programming",
+			"not appropriate", "not ethical", "would be harmful",
+			"is unethical", "is inappropriate", "would be illegal",
+			"is illegal", "can't assist", "cannot assist", 
+			"unable to assist", "not comfortable", "uncomfortable",
+			"violates my ethics", "violates guidelines"
+		]
+		
+		# Check for refusal phrases
+		for phrase in refusal_phrases:
+			if phrase.strip() in response_lower:
+				return True
+				
+		return False
+	
+	def act(self, state, base_state, instructions, enforce_single_question=False):
+		"""
+		Generate an action based on the current state.
+		Enhanced to try multiple perspectives and select the best non-refusal response.
+		
+		Args:
+			state (str or list): Current state (conversation history)
+			base_state (str or list): Original question/base state
+			instructions (str): System instructions
+			enforce_single_question (bool): Whether to enforce a single question in output
 			
 		Returns:
 			action: Generated action
 			act_tokens: Tokenized action
 			log_probs: Log probabilities of action
 		"""
-		assert self.tokenizer.padding_side == 'left'
-		with torch.enable_grad():
-			prepared_prompts = self.prepare_prompt(state, original_questions=base_state, instructions=instructions, inject_perspective=False)
-			tokenized_prompts = self.tokenizer(prepared_prompts, return_tensors='pt', padding=True, add_special_tokens=self.manually_add_bos)
-			responses, tokens, log_probs, _ = self.actor.generate(
-				tokenized_prompts, 
-				enforce_single_question=enforce_single_question,
-				require_grad=True,  # Make sure require_grad is True
-				k=int(max(4*self.eps, 1))
-			)
+		# Standardize inputs to lists
+		if isinstance(state, str):
+			state = [state]
 		
-		# Ensure action ends with EOS token
-		if isinstance(responses, list):
-			responses = [a + self.tokenizer.eos_token if not a.endswith(self.tokenizer.eos_token) else a for a in responses]
+		batch_size = len(state)
+		
+		if base_state is None:
+			base_state = [None] * batch_size
+		elif not isinstance(base_state, list):
+			base_state = [base_state] * batch_size
+			
+		actions_final = []
+		tokens_final = []
+		log_probs_final = []
+			
+		# Prepare prompt for each batch item
+		prompt_options = self.prepare_prompt(state, base_state, instructions, inject_perspective=False)
+		
+		with torch.no_grad():
+			for idx, option_set in enumerate(prompt_options):
+				# Generate multiple responses from different perspectives
+				candidate_actions, candidate_tokens, candidate_log_probs, _ = self.actor.generate(option_set, max_new_tokens=100, require_grad=False)
+
+				# Ensure actions have EOS token and clean BOS tokens
+				for i in range(len(candidate_actions)):
+					if i < len(candidate_actions) and not candidate_actions[i].endswith(self.tokenizer.eos_token):
+						candidate_actions[i] = candidate_actions[i] + self.tokenizer.eos_token
+					
+					# Remove BOS token if present
+					if hasattr(self.tokenizer, 'bos_token') and self.tokenizer.bos_token:
+						candidate_actions[i] = candidate_actions[i].replace(self.tokenizer.bos_token, '')
+
+				original_question = [base_state[idx] for _ in range(len(candidate_actions))]
+				scores = self.actor.get_embed_similarity(candidate_actions, original_question, require_grad=False).to('cpu')
+
+				#check refusals
+				refusal_mask = torch.tensor([self._is_refusal(action) for action in candidate_actions])
+				scores = scores.masked_fill(refusal_mask, -float('inf'))
+
+				#select best action
+				best_action_index = torch.argmax(scores)
+				best_action = candidate_actions[best_action_index]
+				actions_final.append(best_action)
+				tokens_final.append(candidate_tokens[best_action_index])
+				log_probs_final.append(candidate_log_probs[best_action_index])
+
+		# For single batch item case, return directly
+		if batch_size == 1:
+			return actions_final[0], tokens_final[0], log_probs_final[0]
 		else:
-			responses = responses + self.tokenizer.eos_token if not responses.endswith(self.tokenizer.eos_token) else responses
-		responses = [a.replace(self.tokenizer.bos_token, '') for a in responses]
-				
-		return responses, tokens, log_probs.detach()
+			return actions_final, tokens_final, log_probs_final
 	
 	def prepare_prompt(self, prompt, original_questions, instructions, inject_perspective=True):
 		"""returns a list of tokenized prompts with the system and redteam instructions injected.
@@ -937,32 +1041,29 @@ class Agent:
 		output: list of prompt strings"""
 		assert len(prompt) > 0, "Prompt must have at least one message"
 		prepared_prompts = []
-		prompt_idx = random.randint(0, len(instructions['redteam_prompt']) - 1)
-		prompt_injection = instructions['perspectives'][prompt_idx]
-		if not inject_perspective:
-			prompt_injection = ""
+
 		for x, o in zip(prompt, original_questions):
-			if len(x) == 1: #if the prompt is a single string, it is a seed prompt
-				if inject_perspective:
-					chat = self.setup_prompt(x[0], instructions['sysprompt_initial']['content'], instructions['redteam_prompt'][prompt_idx]['content'])
-				else:
-					chat = self.setup_prompt(x[0], instructions['sysprompt_initial']['content'], instructions['redteam_prompt_default']['content'])
-			else:
-				chat = [{'role': 'user', 'content': instructions['redteam_chat_prompt']['content'].format(question=o, conversation=' '.join(x))}]
-				chat.insert(0,{'role': 'system', 'content': instructions['sysprompt_chat']['content'] })
-			templated_prompt = self.tokenizer.apply_chat_template(chat, return_tensors='pt', padding=True, add_generation_prompt=True, tokenize=False) + prompt_injection
-			prepared_prompts.append(templated_prompt)
+			prompt_options = []
+			for i in range(len(instructions['redteam_prompt'])):
+				conversation_str = "".join(x)
+				chat = self.setup_prompt(conversation_str, o, instructions['sysprompt_initial']['content'], instructions['redteam_prompt'][i]['content'])
+				templated_prompt = self.tokenizer.apply_chat_template(chat, return_tensors='pt', padding=True, add_generation_prompt=True, tokenize=False)
+				prompt_options.append(templated_prompt)
+			prepared_prompts.append(prompt_options)
+		
 		return prepared_prompts
 	
-	def setup_prompt(self, prompt, system_instructions, redteam_instructions):
+	def setup_prompt(self, prompt, original_question, system_instructions, redteam_instructions):
 		return [
 			{'role': 'system', 'content': system_instructions},
-			{'role': 'user', 'content': redteam_instructions.format(prompt)},
+			{'role': 'user', 'content': redteam_instructions.format(conversation=prompt, question=original_question)},
 		]
 	
 	def rollout(self, num_steps):
 		"""
 			Perform a rollout by interacting with the environment.
+			In single conversation mode (force_single_conversation=True), this will collect
+			multiple complete episodes sequentially rather than in parallel.
 
 			Returns:
 				batch_state - the observations collected during the rollout
@@ -976,159 +1077,126 @@ class Agent:
 				batch_base_state - the original adversarial question
 				batch_lens - the lengths of each episode
 		"""
-		# Initialize conversation tracking structures - one list per batch item
-		batch_size = self.env.batch_size
-		# Create lists of lists where each inner list represents a conversation thread
+		# Set environment to use force_single_conversation mode if not already set
+		original_force_single_conversation = getattr(self.env, 'force_single_conversation', False)
+		if not original_force_single_conversation:
+			print("Setting environment to force_single_conversation mode for stable processing")
+			self.env.force_single_conversation = True
+			# Store the original batch size so we can restore it later if needed
+			original_batch_size = self.env.batch_size
+			self.env.batch_size = 1
+			self.env.dataloader = DataLoader(self.env.data, batch_size=1, shuffle=True)
+			
+		# Initialize conversation tracking structures - single-episode tracking in single conversation mode
 		conversation_data = {
-			'states': [[] for _ in range(batch_size)],
-			'next_states': [[] for _ in range(batch_size)],
-			'acts': [[] for _ in range(batch_size)],
-			'log_probs': [[] for _ in range(batch_size)],
-			'rews': [[] for _ in range(batch_size)],
-			'dones': [[] for _ in range(batch_size)],
-			'base_states': [[] for _ in range(batch_size)],  # List to track base states for each conversation
-			'action_help_rews': [[] for _ in range(batch_size)] if self.alg == 'ppo' else None,
-			'compliance_rews': [[] for _ in range(batch_size)] if self.alg == 'ppo' else None
+			'states': [],
+			'next_states': [],
+			'acts': [],
+			'log_probs': [],
+			'rews': [],
+			'dones': [],
+			'base_states': [],  # List to track base states for each step
+			'action_help_rews': [] if self.alg == 'ppo' else None,
+			'compliance_rews': [] if self.alg == 'ppo' else None
 		}
-		batch_lens = [0 for _ in range(batch_size)]  # Track length of each conversation thread
-
+		episode_lens = []  # Track length of each episode
+		num_episodes_collected = 0
+		target_episodes = int(num_steps//2)  # Aim to collect this many complete episodes
+		
 		start_time = time.time()
 		state = self.env.reset()
 
 		torch.cuda.empty_cache()
 		
-		# Store initial base states (original adversarial questions)
-		for i in range(batch_size):
-			conversation_data['base_states'][i].append(self.env.base_state[i])
-
-		# Execute rollout steps
-		for step_idx in range(int(num_steps//batch_size)):
+		# Store initial base state (original adversarial question)
+		conversation_data['base_states'].append(self.env.base_state[0])
+		
+		# Execute rollout to collect multiple sequential episodes
+		current_episode_len = 0
+		total_steps = 0
+		
+		while num_episodes_collected < target_episodes and total_steps < num_steps:
 			with torch.set_grad_enabled(True):
-				# Generate actions using the model
+				# Generate action using the model
 				self.to_cuda()
 				self.actor.print_memory(f"Memory usage before act")
 				action, act_tokens, log_probs = self.act(state, self.env.base_state, self.instructions, enforce_single_question=True)
 				self.to_cpu()
 				
 				# Check for empty actions
-				for s, a in zip(state, action):
-					if a.replace("user", "").replace("assistant", "").replace("system", "").strip() == "":
-						print("Empty action: ", s, a)
-				
-				# Track which conversations are already done before this step
-				already_done = self.env.dones.clone()
+				if isinstance(action, list) and action and action[0].replace("user", "").replace("assistant", "").replace("system", "").strip() == "":
+					print("Empty action: ", state[0], action[0])
 				
 				# Take the step in the environment
 				next_state, responses, reward, done = self.env.step(action)
-				# Store data for each conversation thread that's not already done
-				for i in range(batch_size):
-					if already_done[i].item() == 0:  # Only update active conversations
-						batch_lens[i] += 1
-						conversation_data['states'][i].append(state[i])
-						conversation_data['next_states'][i].append(next_state[i])
-						conversation_data['acts'][i].append(act_tokens[i])
-						conversation_data['rews'][i].append(reward[i])
-						conversation_data['dones'][i].append(done[i])
-						conversation_data['log_probs'][i].append(log_probs[i].detach())
-						
-						# Additional rewards for PPO
-						if self.alg == 'ppo':
-							# Get helpfulness of agent's action
-							action_help_score = self.env.score_helpfulness(
-								[[state[i][-1], action[i]]]
-							)
-							# Get compliance reward from target's response
-							compliance_rew = self.env.score_helpfulness(
-								[next_state[i]]
-							)
-							conversation_data['action_help_rews'][i].append(action_help_score[0])
-							conversation_data['compliance_rews'][i].append(compliance_rew[0])
+				
+				# Store data for this step
+				conversation_data['states'].append(state[0])
+				conversation_data['next_states'].append(next_state[0])
+				conversation_data['acts'].append(act_tokens[0])
+				conversation_data['rews'].append(reward[0])
+				conversation_data['dones'].append(done[0])
+				conversation_data['log_probs'].append(log_probs[0].detach())
+				current_episode_len += 1
+				total_steps += 1
+				
+				# Additional rewards for PPO
+				if self.alg == 'ppo':
+					# Get helpfulness of agent's action
+					action_help_score = self.env.score_helpfulness(
+						[[state[0][-1], action[0]]]
+					)
+					# Get compliance reward from target's response
+					compliance_rew = self.env.score_helpfulness(
+						[next_state[0]]
+					)
+					conversation_data['action_help_rews'].append(action_help_score[0])
+					conversation_data['compliance_rews'].append(compliance_rew[0])
 				
 				# Update the current state
 				state = next_state
 				
-				# If all conversations are done, the environment will automatically reset
-				# We need to update our base states to the new ones
-				if done.all():
-					# The environment automatically resets when all are done
-					# Update base states for the next batch of conversations
-					for i in range(batch_size):
-						# The next state now contains the first message of the new conversation
-						conversation_data['base_states'][i].append(self.env.base_state[i])
-				
-				if step_idx == num_steps - 1:
-					break  # We've reached the max steps
-		
-		# Process the collected data into flat lists that maintain chronological order
-		batch_state = []
-		batch_next_state = []
-		batch_acts = []
-		batch_log_probs = []
-		batch_rews = []
-		batch_dones = []
-		batch_base_state = []
-		batch_action_help_rews = [] if self.alg == 'ppo' else None
-		batch_compliance_rews = [] if self.alg == 'ppo' else None
-		
-		# Flatten the conversation data while maintaining chronological order
-		for i in range(batch_size):
-			states_len = len(conversation_data['states'][i])
-			if states_len > 0:  # Only process non-empty conversations
-				batch_state.extend(conversation_data['states'][i])
-				batch_next_state.extend(conversation_data['next_states'][i])
-				batch_acts.extend(conversation_data['acts'][i])
-				batch_log_probs.extend(conversation_data['log_probs'][i])
-				batch_rews.extend(conversation_data['rews'][i])
-				batch_dones.extend(conversation_data['dones'][i])
-				
-				# Add base states - one for each step in the conversation
-				# We need to handle the case where a conversation spans multiple base states 
-				# (i.e., the environment reset during this conversation thread)
-				base_state_idx = 0
-				for j in range(states_len):
-					# If this step marks a done state and it's not the last step, increment the base state index
-					if j < states_len - 1 and conversation_data['dones'][i][j].item() == 1:
-						base_state_idx += 1
+				# Check if this episode is done
+				if done[0].item() == 1:
+					# Record episode length
+					episode_lens.append(current_episode_len)
+					num_episodes_collected += 1
+					current_episode_len = 0
 					
-					# Make sure we don't go out of bounds
-					if base_state_idx < len(conversation_data['base_states'][i]):
-						batch_base_state.append(conversation_data['base_states'][i][base_state_idx])
-					else:
-						# Fallback if we somehow have more states than base states
-						batch_base_state.append(conversation_data['base_states'][i][-1])
-				
-				if self.alg == 'ppo':
-					batch_action_help_rews.extend(conversation_data['action_help_rews'][i])
-					batch_compliance_rews.extend(conversation_data['compliance_rews'][i])
-		# Skip further processing if no data was collected
-		if len(batch_state) == 0:
-			print(conversation_data)
-			raise RuntimeError("No valid data collected in rollout - all conversations were done")
-			
+					# The environment automatically resets when done
+					# Update base state for the next episode
+					conversation_data['base_states'].append(self.env.base_state[0])
+					
+					print(f"Collected episode {num_episodes_collected}/{target_episodes}, steps so far: {total_steps}/{num_steps}")
+					
+					if num_episodes_collected >= target_episodes:
+						break
+		
 		# Tokenize and process the collected data
-		batch_state = self.tokenizer(self.prepare_prompt(batch_state, batch_base_state, self.instructions, inject_perspective=False), 
+		batch_state = self.tokenizer(self.prepare_prompt(conversation_data['states'], conversation_data['base_states'], self.instructions, inject_perspective=False), 
 									return_tensors='pt', padding=True,
 									add_special_tokens=self.manually_add_bos).input_ids.squeeze()
-		batch_next_state = self.tokenizer(self.prepare_prompt(batch_next_state, batch_base_state, self.instructions, inject_perspective=False), 
+		batch_next_state = self.tokenizer(self.prepare_prompt(conversation_data['next_states'], conversation_data['base_states'], self.instructions, inject_perspective=False), 
 										return_tensors='pt', padding=True,
 										add_special_tokens=self.manually_add_bos).input_ids.squeeze()
-		batch_base_state = self.tokenizer(batch_base_state, return_tensors='pt', padding=True).input_ids.squeeze()
-		batch_acts = self._pad_batch_acts(batch_acts)
-		batch_rews = torch.stack(batch_rews).squeeze()
-		batch_dones = torch.stack(batch_dones).squeeze()
+		batch_base_state = self.tokenizer(conversation_data['base_states'], return_tensors='pt', padding=True).input_ids.squeeze()
+		batch_acts = self._pad_batch_acts(conversation_data['acts'])
+		batch_rews = torch.stack(conversation_data['rews']).squeeze()
+		batch_dones = torch.stack(conversation_data['dones']).squeeze()
 		
 		if self.alg == 'ppo':
-			batch_action_help_rews = torch.stack(batch_action_help_rews).squeeze()
-			batch_compliance_rews = torch.stack(batch_compliance_rews).squeeze()
+			batch_action_help_rews = torch.stack(conversation_data['action_help_rews']).squeeze()
+			batch_compliance_rews = torch.stack(conversation_data['compliance_rews']).squeeze()
 		
-		batch_log_probs = self._pad_batch_log_probs(batch_log_probs, batch_acts)
+		batch_log_probs = self._pad_batch_log_probs(conversation_data['log_probs'], batch_acts)
 		
 		# Verify shapes if we have data
 		if batch_state.numel() > 0:
 			assert batch_state.shape[0] == batch_acts.shape[0], f"Batch state and batch acts have different lengths: {batch_state.shape[0]} != {batch_acts.shape[0]}"
 			assert batch_acts.shape == batch_log_probs.shape, f"Batch acts and batch log probs have different lengths: {batch_acts.shape} != {batch_log_probs.shape}"
 		
-		print(f"Rollouts collected: {batch_state.shape[0]} in {time.time() - start_time} seconds. Average reward: {batch_rews.sum()/batch_state.shape[0]}. Tokens per batch: {torch.tensor(batch_state.shape).prod()}")
+		print(f"Rollouts collected: {batch_state.shape[0]} steps across {num_episodes_collected} episodes in {time.time() - start_time} seconds.")
+		print(f"Average reward: {batch_rews.sum()/batch_state.shape[0]:.4f}. Tokens per batch: {torch.tensor(batch_state.shape).prod()}")
 		torch.cuda.empty_cache()
 		
 		# Create a rollout object and return it
@@ -1139,7 +1207,7 @@ class Agent:
 			'batch_log_probs': batch_log_probs,
 			'batch_rews': batch_rews,
 			'batch_dones': batch_dones,
-			'batch_lens': batch_lens,
+			'batch_lens': episode_lens,
 			'batch_base_state': batch_base_state
 		}
 		if self.alg == 'ppo':
@@ -1154,6 +1222,13 @@ class Agent:
 			sample_a = self.tokenizer.decode(batch_acts[sample_idx], skip_special_tokens=True)
 			print(f"Sample: \nQuestion: {sample_q}\nRephrase: {sample_a}\nReward: {batch_rews[sample_idx]}\n")
 		self.actor.print_memory(f"Memory usage after rollout")
+		
+		# Restore original environment settings if we changed them
+		if not original_force_single_conversation:
+			self.env.force_single_conversation = False
+			self.env.batch_size = original_batch_size
+			self.env.dataloader = DataLoader(self.env.data, batch_size=original_batch_size, shuffle=True)
+			
 		return rollout
 	
 	def breakdown_rollout(self, t):
@@ -1353,6 +1428,7 @@ class Agent:
 					'keep_base_on_cpu' - whether to keep the base model on CPU while adapters are on GPU for memory efficiency
 					'value_loss_coef' - coefficient to scale the value loss to balance with actor loss
 					'attention_divergence_weight' - weight for attention divergence regularization loss (default: 0.1)
+					'invert_critic_scores' - whether to invert harm critic scores for advantage calculation
 			
 			Return:
 				None
@@ -1380,6 +1456,7 @@ class Agent:
 		'keep_base_on_cpu': False,  # Whether to keep the base model on CPU and only adapters on GPU for memory efficiency
 		'value_loss_coef': 0.5,  # Coefficient to scale the value loss to balance with actor loss
 		'attention_divergence_weight': 0.001,  # Weight for attention divergence regularization loss
+		'invert_critic_scores': False # Whether to invert harm critic scores for advantage calculation
 		}
 		# Change any default values to custom values for specified hyperparameters
 		for param, val in default_hyperparameters.items():
@@ -2055,8 +2132,16 @@ class Agent:
 			path = f'./models/{self.model_name}/training_log.csv'
 		else:
 			path = f'./models/{self.model_name}/adapters/{self.current_adapter}/training_log.csv'
+
+		# Create directory structure if needed
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+
+		# Check if file exists and has content
+		file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+
+		# Open and write to the file
 		with open(path, 'a') as f:
-			if os.path.getsize(path) == 0:
+			if not file_exists:
 				f.write(','.join(batch_log.keys()) + '\n')
 			f.write(','.join(str(v) for v in batch_log.values()) + '\n')
 
@@ -2520,14 +2605,16 @@ class Agent:
 def getPolicyClass(type):
 	classTypes = {
 		'Transformer': TransformerPolicy,
-		'CPUTransformer': CPUOffloadTransformerPolicy
+		'CPUTransformer': CPUOffloadTransformerPolicy,
+		'None': None
 	}
 	return classTypes.get(type, TransformerPolicy)
 
 def getTokenizerClass(type):
 	classTypes = {
 		'Transformer': AutoTokenizer,
-		'SACTransformer': AutoTokenizer
+		'SACTransformer': AutoTokenizer,
+		'None': None
 	}
 	return classTypes[type]
 

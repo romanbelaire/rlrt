@@ -30,3 +30,11 @@ llama-Guard-3-1B/
 .cursor/
 HarmBench/
 checkpoints/
+hf_api
+ant_api
+api.json
+openai_api.json
+deprecated/
+conversations/
+outputs/
+results/

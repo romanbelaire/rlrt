@@ -1,0 +1,389 @@
+"""
+Critic implementations for reinforcement learning agents.
+
+This module provides implementations of value function estimators (critics)
+that are used to evaluate states and actions in the reinforcement learning process.
+"""
+
+from typing import Dict, List, Tuple, Union, Any
+from abc import ABC, abstractmethod
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import (
+    AutoModelForCausalLM,
+    AutoConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer
+)
+import os
+
+from base import Critic, ModelBase
+from utils import apply_activation_clamping
+
+class AbstractValueCritic(ModelBase, Critic, ABC):
+    """
+    Abstract base class for value critics using transformer models.
+    
+    This class provides common functionality for value estimation and defines
+    the interface that concrete implementations must follow.
+    """
+    
+    def __init__(self, 
+                 hf_checkpoint: str, 
+                 tokenizer: PreTrainedTokenizer,
+                 model: PreTrainedModel) -> None:
+        """
+        Initialize the abstract value critic.
+        
+        Args:
+            hf_checkpoint: Hugging Face model checkpoint path/name
+            tokenizer: Tokenizer for the model
+            model: Pre-loaded model instance
+        """
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.hf_checkpoint = hf_checkpoint
+        
+        # Use provided model instance
+        self.model = model
+            
+        # Freeze the base model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # Initialize the value head (to be defined by subclasses)
+        self._init_value_head()
+        
+        # Ensure value head parameters have gradients enabled (not frozen like base model)
+        for param in self.value_head.parameters():
+            param.requires_grad = True
+        
+        # Match the dtype of the base model to avoid dtype mismatches
+        model_dtype = next(self.model.parameters()).dtype
+        # Ensure value head uses bf16 for consistency
+        if model_dtype == torch.bfloat16:
+            self.value_head = self.value_head.to(dtype=torch.bfloat16)
+        else:
+            self.value_head = self.value_head.to(dtype=model_dtype)
+                    
+        # Default to CPU, will be moved to appropriate device when needed
+        self.to('cpu')
+
+        # ------------------------------------------------------------------
+        # Memory optimisation for critics (b, c, d from user request)
+        # b) Disable key-value cache to avoid storing past states we never reuse
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
+
+        # c) Enable gradient checkpointing *only* when some base-model parameters
+        #    are trainable.  When the backbone is entirely frozen (as in our
+        #    critics) checkpointing provides zero benefit but still emits a
+        #    warning and adds overhead.
+        if any(p.requires_grad for p in self.model.parameters()):
+            if not getattr(self.model, "gradient_checkpointing", False):
+                try:
+                    self.model.gradient_checkpointing_enable()
+                except AttributeError:
+                    raise RuntimeError("Base model does not support gradient checkpointing")
+
+        # d) Use memory-efficient FlashAttention v2 when available.
+        if hasattr(self.model.config, "attn_implementation"):
+            self.model.config.attn_implementation = "flash_attention_2"
+        # ------------------------------------------------------------------
+        
+        # Set default forward hook configuration
+        self.enable_forward_hooks = True
+        self.forward_hook_clamp_range = 30.0
+        self.forward_hook_layernorm_range = 10.0
+    
+    def setup_forward_hooks(self, enable_hooks: bool = True, clamp_range: float = 30.0, layernorm_range: float = 10.0) -> None:
+        """
+        Set up forward hook configuration.
+        
+        Args:
+            enable_hooks: Whether to use activation clamping hooks
+            clamp_range: Clamp range for activation hooks (-range to +range)
+            layernorm_range: Clamp range for LayerNorm hooks (-range to +range)
+        """
+        self.enable_forward_hooks = enable_hooks
+        self.forward_hook_clamp_range = clamp_range
+        self.forward_hook_layernorm_range = layernorm_range
+    
+    @abstractmethod
+    def _init_value_head(self) -> None:
+        """Initialize the value head architecture. Must be implemented by subclasses."""
+        pass
+        
+    @property
+    @abstractmethod
+    def is_token_level(self) -> bool:
+        """Whether this is a token-level critic. Must be implemented by subclasses."""
+        pass
+        
+    @abstractmethod
+    def _compute_values(self, 
+                       hidden_states: torch.Tensor, 
+                       attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute value estimates from hidden states.
+        Must be implemented by subclasses.
+        
+        Args:
+            hidden_states: Hidden states from the transformer
+            attention_mask: Attention mask for the input
+            
+        Returns:
+            Value estimates
+        """
+        pass
+        
+    def forward(self, 
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                return_attention: bool = False,
+                requires_grad: bool = False,
+                **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Compute value estimates for given inputs.
+        
+        Args:
+            input_ids: Input token ids (state + action for sequence-level, state + action_so_far for token-level)
+            attention_mask: Attention mask
+            return_attention: Whether to return attention weights
+            requires_grad: Whether to calculate gradients
+            **kwargs: Additional arguments
+            
+        Returns:
+            Value estimates (and optionally attention weights)
+        """
+        # Determine compute device
+        compute_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        base_device = next(self.model.parameters()).device
+        
+        # Move input tensors to the compute device
+        input_ids = input_ids.to(compute_device)
+        attention_mask = attention_mask.to(compute_device)
+        
+        # Move model to compute device if needed
+        if base_device != compute_device:
+            self.model.to(compute_device)
+            
+        # Move value head to compute device
+        self.value_head.to(compute_device)
+        
+        # Forward pass through the model with gradient control
+        with torch.set_grad_enabled(requires_grad):
+            # Get model outputs with activation clamping
+            outputs = apply_activation_clamping(
+                self.model,
+                self.model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_attentions=return_attention,
+                return_dict=True,
+                enable_hooks=self.enable_forward_hooks,
+                clamp_range=self.forward_hook_clamp_range,
+                layernorm_range=self.forward_hook_layernorm_range,
+                # Memory-saving flags --------------------------------------------------
+                use_cache=False,                    # (b) explicitly disable KV cache
+                attn_implementation="flash_attention_2",  # (d) flash-attention
+                # ---------------------------------------------------------------------
+                **kwargs
+            )
+            
+            # Get the hidden states from the last layer
+            hidden_states = outputs.hidden_states[-1]
+            
+            # ------------------------------------------------------------------
+            # MEMORY OPTIMISATION: the transformer backbone is *frozen* so we do
+            # **not** require gradients w.r.t. its parameters.  However, leaving
+            # the graph intact would force PyTorch to keep a full history of all
+            # intermediate activations for *every* transformer layer – easily
+            # tens of gigabytes for an 8-b model.
+            #
+            # We therefore detach the hidden states from the graph, freeing the
+            # backbone activations immediately, and (optionally) mark the
+            # detached tensor as requiring grad so that the small value-head can
+            # still be updated.
+            # ------------------------------------------------------------------
+            hidden_states = hidden_states.detach()
+            if requires_grad:
+                hidden_states.requires_grad_(True)
+            
+            # Compute values using subclass-specific logic
+            values = self._compute_values(hidden_states, attention_mask)
+            
+            # Get attention weights if requested
+            attentions = outputs.attentions if return_attention else None
+        
+        # Return appropriate results based on flags
+        if return_attention:
+            return values, attentions
+        else:
+            return values
+            
+    def cleanup_gpu_memory(self) -> None:
+        """Explicitly clear GPU memory."""
+        self.model.to('cpu')
+        self.value_head.to('cpu')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class SequenceLevelValueCritic(AbstractValueCritic):
+    """
+    High-level Q function for sequence-level rewards.
+    
+    Takes concatenated state+action tokens and predicts a scalar value 
+    representing the expected Bellman reward (harm score) for the entire action sequence.
+    This approximates Q_high(state, action) where action is a complete sequence.
+    """
+    
+    def _init_value_head(self) -> None:
+        """Initialize sequence-level value head."""
+        hidden_size = self.model.config.hidden_size
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # Initialize weights
+        for module in self.value_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    @property
+    def is_token_level(self) -> bool:
+        """This is not a token-level critic."""
+        return False
+    
+    def _compute_values(self, 
+                       hidden_states: torch.Tensor, 
+                       attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute sequence-level value by mean pooling over all tokens.
+        
+        Args:
+            hidden_states: Hidden states from transformer [batch, seq_len, hidden_size]
+            attention_mask: Attention mask [batch, seq_len]
+            
+        Returns:
+            Sequence-level values [batch]
+        """
+        # Mean pooling over all tokens
+        pooled_hidden_states = hidden_states.mean(dim=1)
+        
+        # Apply the value head to get sequence-level value
+        values = self.value_head(pooled_hidden_states).squeeze(-1)
+        
+        # Ensure consistent dtype with model
+        model_dtype = next(self.model.parameters()).dtype
+        values = values.to(dtype=model_dtype)
+        
+        return values
+    
+    def save(self, save_path: str) -> None:
+        """
+        Save the critic model.
+        
+        Args:
+            save_path: Path to save the model to
+        """
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(self.value_head.state_dict(), os.path.join(save_path, "sequence_value_head.pt"))
+        print(f"Saved sequence-level value head to {save_path}")
+        
+    def load(self, load_path: str) -> None:
+        """
+        Load the critic model.
+        
+        Args:
+            load_path: Path to load the model from
+        """
+        value_head_path = os.path.join(load_path, "sequence_value_head.pt")
+        self.value_head.load_state_dict(torch.load(value_head_path))
+        print(f"Loaded sequence-level value head from {load_path}")
+
+
+class TokenLevelValueCritic(AbstractValueCritic):
+    """
+    Low-level Q function for token-level marginal contributions.
+    
+    Takes state+action_so_far tokens and predicts a scalar value representing
+    the marginal contribution/Bellman reward for the last token in the sequence.
+    This approximates Q_low(state, action_so_far) for the marginal utility of the next token.
+    """
+    
+    def _init_value_head(self) -> None:
+        """Initialize token-level value head with layer normalization."""
+        hidden_size = self.model.config.hidden_size
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # Initialize weights
+        for module in self.value_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    @property
+    def is_token_level(self) -> bool:
+        """This is a token-level critic."""
+        return True
+    
+    def _compute_values(self, 
+                       hidden_states: torch.Tensor, 
+                       attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-token values for marginal contribution of each token.
+        
+        Args:
+            hidden_states: Hidden states from transformer [batch, seq_len, hidden_size]
+            attention_mask: Attention mask [batch, seq_len]
+            
+        Returns:
+            Per-token values [batch, seq_len]
+        """
+        # Apply value head to each token position
+        values = self.value_head(hidden_states).squeeze(-1)  # [batch, seq_len]
+        
+        # Mask out pad tokens
+        values = values * attention_mask.float()
+        
+        # Ensure consistent dtype with model
+        model_dtype = next(self.model.parameters()).dtype
+        values = values.to(dtype=model_dtype)
+        
+        return values
+    
+    def save(self, save_path: str) -> None:
+        """
+        Save the critic model.
+        
+        Args:
+            save_path: Path to save the model to
+        """
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(self.value_head.state_dict(), os.path.join(save_path, "token_value_head.pt"))
+        print(f"Saved token-level value head to {save_path}")
+        
+    def load(self, load_path: str) -> None:
+        """
+        Load the critic model.
+        
+        Args:
+            load_path: Path to load the model from
+        """
+        value_head_path = os.path.join(load_path, "token_value_head.pt")
+        self.value_head.load_state_dict(torch.load(value_head_path))
+        print(f"Loaded token-level value head from {load_path}")

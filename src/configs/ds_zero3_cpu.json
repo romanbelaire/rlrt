@@ -1,0 +1,22 @@
+{
+  "train_micro_batch_size_per_gpu": 1,
+  "train_batch_size": 1,
+  "zero_optimization": {
+    "stage": 3,
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "offload_optimizer": {
+      "device": "none"
+    },
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "overlap_comm": true,
+    "contiguous_gradients": false
+  },
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "initial_scale_power": 16
+  }
+} 

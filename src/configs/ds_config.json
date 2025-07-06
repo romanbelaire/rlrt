@@ -1,0 +1,36 @@
+{
+    "dtype": "fp16",
+    "replace_method": "auto",
+    "injection_policy": {
+        "LlamaDecoderLayer": {
+            "attention": {
+                "q_proj": "attention",
+                "k_proj": "attention",
+                "v_proj": "attention",
+                "o_proj": "attention"
+            },
+            "mlp": {
+                "gate_proj": "mlp",
+                "up_proj": "mlp",
+                "down_proj": "mlp"
+            }
+        }
+    },
+    "tensor_parallel": {
+        "tp_size": 1
+    },
+    "enable_cuda_graph": false,
+    "max_out_tokens": 1024,
+    "min_out_tokens": 1,
+    "max_tokens": 2048,
+    "checkpoint": null,
+    "base_dir": "outputs/refactored-run",
+    "local_rank": -1,
+    "kernel_inject": true,
+    "replace_with_kernel_inject": true,
+    "inference_params": {
+        "max_out_tokens": 1024,
+        "min_out_tokens": 1,
+        "max_tokens": 2048
+    }
+} 
