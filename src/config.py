@@ -117,6 +117,9 @@ class TrainingConfig:
     
     # Token-level RL settings
     use_per_token_advantages: bool = True  # Whether to use per-token advantages (True) or sequence-level (False)
+    
+    # Memory optimization for marginal reward computation
+    max_marginal_token_positions: int = 10  # Maximum number of token positions to process for marginal rewards
 
 
 @dataclass

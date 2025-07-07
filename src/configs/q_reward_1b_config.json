@@ -56,7 +56,12 @@
     "critic_chunking_threshold": 100,
     "critic_max_chunk_size": 2,
     "critic_memory_fraction": 0.6,
-    "use_task_reward": true
+    "use_task_reward": true,
+    "use_per_token_advantages": true,
+    "actor_chunking_enabled": true,
+    "actor_max_chunk_size": 8,
+    "actor_memory_fraction": 0.7,
+    "max_marginal_token_positions": 10
   },
   "model": {
     "model_name": "q-reward-agent-8b70t",

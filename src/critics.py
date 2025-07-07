@@ -174,10 +174,43 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
         
         # Forward pass through the model with gradient control
         with torch.set_grad_enabled(requires_grad):
+            # MEMORY OPTIMIZATION: Create a custom forward pass that avoids loading the language model head
+            # This prevents the massive memory allocation from the vocabulary projection
+            def custom_forward(*args, **kwargs):
+                # Remove any logits-related arguments to prevent LM head computation
+                kwargs.pop('labels', None)
+                kwargs.pop('lm_labels', None)
+                
+                # Call the model's forward method but stop at hidden states
+                # We need to access the transformer layers directly to avoid the LM head
+                if hasattr(self.model, 'model'):
+                    # For models with a 'model' attribute (like LlamaForCausalLM)
+                    transformer_outputs = self.model.model(
+                        *args,
+                        output_hidden_states=True,
+                        output_attentions=return_attention,
+                        return_dict=True,
+                        use_cache=False,
+                        **kwargs
+                    )
+                else:
+                    # For models without a 'model' attribute, try to access layers directly
+                    # This is a fallback and may not work for all model architectures
+                    transformer_outputs = self.model(
+                        *args,
+                        output_hidden_states=True,
+                        output_attentions=return_attention,
+                        return_dict=True,
+                        use_cache=False,
+                        **kwargs
+                    )
+                
+                return transformer_outputs
+            
             # Get model outputs with activation clamping
             outputs = apply_activation_clamping(
                 self.model,
-                self.model,
+                custom_forward,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,

@@ -894,6 +894,14 @@ class AgentTrainer:
                 # Remove duplicates and sort
                 valid_token_positions = sorted(list(set(valid_token_positions)))
                 
+                # MEMORY OPTIMIZATION: Limit the number of token positions to process
+                # This prevents excessive memory usage when there are many important tokens
+                max_token_positions = getattr(self.config.training, 'max_marginal_token_positions', 10)
+                if len(valid_token_positions) > max_token_positions:
+                    # Take the most important tokens (first ones after sorting)
+                    valid_token_positions = valid_token_positions[:max_token_positions]
+                    print(f"Limited token positions from {len(valid_token_positions) + (len(valid_token_positions) - max_token_positions)} to {max_token_positions} for memory efficiency")
+                
             else:
                 # No sequence critic provided - this should not happen in our codebase
                 raise ValueError("Sequence critic must be provided for attention-guided token selection")
@@ -928,7 +936,11 @@ class AgentTrainer:
             pairwise_count: Dict[int, int] = {}
 
             if all_masked_attentions:
-                max_chunk_size = self.config.training.batch_size
+                # Use smaller chunk size for Q-as-reward to reduce memory usage
+                if use_q_as_reward:
+                    max_chunk_size = min(2, self.config.training.batch_size)  # Smaller chunks for Q-as-reward
+                else:
+                    max_chunk_size = self.config.training.batch_size
                 
                 # Process in chunks 
                 for chunk_start in range(0, len(all_masked_attentions), max_chunk_size):
@@ -969,6 +981,13 @@ class AgentTrainer:
                         # Clean up list of tensors
                         del chunk_scores_list
                         torch.cuda.empty_cache()
+                        
+                        # Additional memory cleanup for Q-as-reward
+                        if use_q_as_reward:
+                            # Force garbage collection and memory cleanup
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
                     else:
                         # Original environment-based scoring
                         chunk_masked_texts = []
