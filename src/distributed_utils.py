@@ -11,7 +11,7 @@ import json
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from config import TrainingConfig, ModelConfig, AgentConfig
+from src.config import TrainingConfig, ModelConfig, AgentConfig
 
 from accelerate import Accelerator
 from accelerate.utils import gather_object, set_seed

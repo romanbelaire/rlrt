@@ -1078,3 +1078,48 @@ def attach_permanent_activation_clamping(model, enable_hooks: bool = True, clamp
     
     print(f"Attached {len(hooks)} permanent activation clamping hooks to model (clamp_range: ±{clamp_range}, layernorm_range: ±{layernorm_range})")
     return hooks
+
+def safe_load_state_dict(
+    model: nn.Module, 
+    state_dict: Dict[str, torch.Tensor], 
+    key_name: str,
+    strict: bool = True
+) -> Tuple[bool, Optional[str]]:
+    """
+    Safely load a state dict with backward compatibility and architecture validation.
+    
+    Args:
+        model: The model to load state dict into
+        state_dict: The checkpoint state dict
+        key_name: Name of the key in state_dict to load
+        strict: Whether to enforce strict loading (architecture must match exactly)
+        
+    Returns:
+        Tuple of (success: bool, error_message: Optional[str])
+    """
+    if key_name not in state_dict:
+        warnings.warn(f"Key '{key_name}' not found in checkpoint. Initializing {model.__class__.__name__} from scratch.")
+        return True, None
+    
+    try:
+        # Try to load with strict=True first to catch architecture mismatches
+        model.load_state_dict(state_dict[key_name], strict=True)
+        return True, None
+    except RuntimeError as e:
+        if "size mismatch" in str(e) or "Unexpected key(s)" in str(e):
+            # Architecture mismatch - this is an error
+            error_msg = f"Architecture mismatch for {model.__class__.__name__}: {str(e)}"
+            return False, error_msg
+        elif not strict:
+            # Try non-strict loading for backward compatibility
+            try:
+                model.load_state_dict(state_dict[key_name], strict=False)
+                warnings.warn(f"Loaded {model.__class__.__name__} with non-strict loading due to missing keys.")
+                return True, None
+            except Exception as e2:
+                error_msg = f"Failed to load {model.__class__.__name__} even with non-strict loading: {str(e2)}"
+                return False, error_msg
+        else:
+            # Strict loading failed and strict=True
+            error_msg = f"Failed to load {model.__class__.__name__} with strict loading: {str(e)}"
+            return False, error_msg

@@ -12,6 +12,7 @@ import json
 import openai
 from openai import OpenAI
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class OpenAITargetModel:
     """
@@ -77,10 +78,215 @@ class OpenAITargetModel:
         self.tokens_per_minute = 200000  # Conservative limit
         self.request_times = []
         
+        # Initialize frozen Llama model for perplexity computations
+        self._init_perplexity_model()
+        
         if self.debug_mode:
             print(f"OpenAI Target Model initialized: {model_name}")
             print(f"Max tokens: {max_new_tokens}, Temperature: {temperature}")
             print(f"Concurrent requests: {max_concurrent_requests}")
+    
+    def _init_perplexity_model(self):
+        """Initialize a frozen Llama model for perplexity computations."""
+        try:
+            print("Initializing frozen Llama model for perplexity computations...")
+            
+            # Determine GPU placement strategy for multi-GPU setups
+            # Strategy: GPU 0 for agent models (training), GPU 1 for inference models (target + guard + perplexity)
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            perplexity_prefer_gpu = 1 if num_gpus > 1 else None
+            
+            if perplexity_prefer_gpu is not None:
+                print(f"Multi-GPU setup detected: targeting PERPLEXITY model for GPU {perplexity_prefer_gpu} (inference GPU)")
+            
+            # Load tokenizer
+            self.perplexity_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+            if self.perplexity_tokenizer.pad_token is None:
+                self.perplexity_tokenizer.pad_token = self.perplexity_tokenizer.eos_token
+            
+            # Load model with device map for efficient memory usage
+            if perplexity_prefer_gpu is not None and perplexity_prefer_gpu < num_gpus:
+                # Place entire model on specified GPU
+                device_map = {f"": perplexity_prefer_gpu}
+                print(f"Placing perplexity model on GPU {perplexity_prefer_gpu}")
+            else:
+                # Auto placement across available GPUs
+                device_map = "auto"
+                print(f"Using auto device placement for perplexity model across {num_gpus} GPUs")
+            
+            self.perplexity_model = AutoModelForCausalLM.from_pretrained(
+                "meta-llama/Llama-3.2-1B-Instruct",
+                device_map=device_map,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2"
+            )
+            
+            # Freeze the model for perplexity computations
+            for param in self.perplexity_model.parameters():
+                param.requires_grad = False
+            
+            self.perplexity_model.eval()
+            
+            # Log device placement information
+            if hasattr(self.perplexity_model, 'hf_device_map'):
+                print(f"Perplexity model device placement: {self.perplexity_model.hf_device_map}")
+            else:
+                try:
+                    device = next(self.perplexity_model.parameters()).device
+                    print(f"Perplexity model placed on device: {device}")
+                except StopIteration:
+                    print(f"Perplexity model has no parameters to check device placement")
+            
+            print("Successfully initialized frozen Llama model for perplexity computations")
+            
+        except Exception as e:
+            print(f"Warning: Failed to initialize perplexity model: {e}")
+            print("Perplexity computations will not be available")
+            self.perplexity_model = None
+            self.perplexity_tokenizer = None
+    
+    def compute_perplexity(self, texts: List[str]) -> torch.Tensor:
+        """
+        Compute perplexity of texts using the frozen Llama model.
+        
+        Args:
+            texts: List of texts to compute perplexity for
+            
+        Returns:
+            Perplexity scores as a tensor
+        """
+        if self.perplexity_model is None or self.perplexity_tokenizer is None:
+            # Return neutral perplexity scores if model is not available
+            return torch.ones(len(texts), device="cpu") * 1.0
+        
+        try:
+            # Tokenize texts
+            inputs = self.perplexity_tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512
+            )
+            
+            # Move to the same device as the model
+            device = next(self.perplexity_model.parameters()).device
+            input_ids = inputs.input_ids.to(device)
+            attention_mask = inputs.attention_mask.to(device)
+            
+            with torch.no_grad():
+                # Get logits
+                outputs = self.perplexity_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True
+                )
+                
+                logits = outputs.logits
+                
+                # Compute perplexity for each sequence
+                perplexities = []
+                for i in range(len(texts)):
+                    # Get valid tokens (exclude padding)
+                    valid_mask = attention_mask[i] == 1
+                    if valid_mask.sum() <= 1:  # Need at least 2 tokens for perplexity
+                        perplexities.append(1.0)
+                        continue
+                    
+                    # Get logits for valid positions (excluding the last token as target)
+                    valid_logits = logits[i, :-1][valid_mask[:-1]]
+                    valid_targets = input_ids[i, 1:][valid_mask[:-1]]
+                    
+                    if len(valid_targets) == 0:
+                        perplexities.append(1.0)
+                        continue
+                    
+                    # Compute log probabilities
+                    log_probs = torch.log_softmax(valid_logits, dim=-1)
+                    target_log_probs = log_probs.gather(-1, valid_targets.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Compute perplexity: exp(-mean(log_prob))
+                    mean_log_prob = target_log_probs.mean()
+                    perplexity = torch.exp(-mean_log_prob)
+                    perplexities.append(perplexity.item())
+                
+                return torch.tensor(perplexities, device="cpu")
+                
+        except Exception as e:
+            print(f"Error computing perplexity: {e}")
+            # Return neutral perplexity scores on error
+            return torch.ones(len(texts), device="cpu") * 1.0
+    
+    def get_log_probs(self, texts: List[str]) -> torch.Tensor:
+        """
+        Get log probabilities of texts using the frozen Llama model.
+        
+        Args:
+            texts: List of texts to get log probabilities for
+            
+        Returns:
+            Log probability scores as a tensor
+        """
+        if self.perplexity_model is None or self.perplexity_tokenizer is None:
+            # Return neutral log probabilities if model is not available
+            return torch.zeros(len(texts), device="cpu")
+        
+        try:
+            # Tokenize texts
+            inputs = self.perplexity_tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512
+            )
+            
+            # Move to the same device as the model
+            device = next(self.perplexity_model.parameters()).device
+            input_ids = inputs.input_ids.to(device)
+            attention_mask = inputs.attention_mask.to(device)
+            
+            with torch.no_grad():
+                # Get logits
+                outputs = self.perplexity_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True
+                )
+                
+                logits = outputs.logits
+                
+                # Compute log probabilities for each sequence
+                log_probs_list = []
+                for i in range(len(texts)):
+                    # Get valid tokens (exclude padding)
+                    valid_mask = attention_mask[i] == 1
+                    if valid_mask.sum() <= 1:  # Need at least 2 tokens
+                        log_probs_list.append(0.0)
+                        continue
+                    
+                    # Get logits for valid positions (excluding the last token as target)
+                    valid_logits = logits[i, :-1][valid_mask[:-1]]
+                    valid_targets = input_ids[i, 1:][valid_mask[:-1]]
+                    
+                    if len(valid_targets) == 0:
+                        log_probs_list.append(0.0)
+                        continue
+                    
+                    # Compute log probabilities
+                    log_probs = torch.log_softmax(valid_logits, dim=-1)
+                    target_log_probs = log_probs.gather(-1, valid_targets.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Return mean log probability
+                    mean_log_prob = target_log_probs.mean()
+                    log_probs_list.append(mean_log_prob.item())
+                
+                return torch.tensor(log_probs_list, device="cpu")
+                
+        except Exception as e:
+            print(f"Error computing log probabilities: {e}")
+            # Return neutral log probabilities on error
+            return torch.zeros(len(texts), device="cpu")
     
     def _rate_limit_check(self):
         """Check and enforce rate limits."""
@@ -250,6 +456,18 @@ class OpenAITargetModel:
     def parameters(self):
         """Return empty parameters for compatibility."""
         return []
+    
+    def get_perplexity_model(self):
+        """Get the frozen Llama model used for perplexity computations."""
+        return self.perplexity_model
+    
+    def get_perplexity_tokenizer(self):
+        """Get the tokenizer used for perplexity computations."""
+        return self.perplexity_tokenizer
+    
+    def has_perplexity_model(self):
+        """Check if perplexity model is available."""
+        return self.perplexity_model is not None and self.perplexity_tokenizer is not None
 
 
 class OpenAITargetTokenizer:

@@ -20,10 +20,211 @@ from transformers import (
 )
 import numpy as np
 from abc import ABC, abstractmethod
+try:
+    from transformers.generation.logits_processor import LogitsProcessor
+except ImportError:
+    # Fallback for newer versions of transformers
+    from transformers import LogitsProcessor
 
-from base import Policy, ModelBase, Environment
-from utils import safe_tokenizer_call, post_tokenizer_injection, build_chat, apply_activation_clamping, attach_permanent_activation_clamping
-from environment import ClampLogitsProcessor
+import torch.nn.functional as F
+
+from src.base import Policy, ModelBase, Environment
+from src.environment import ClampLogitsProcessor
+from src.utils import safe_tokenizer_call, build_chat, apply_activation_clamping, attach_permanent_activation_clamping
+
+
+class RefusalSuppressionProcessor(LogitsProcessor):
+    """
+    Logits processor that suppresses tokens that would lead to refusal phrases.
+    
+    This processor reduces the probability of tokens that would start common
+    refusal patterns like "I cannot", "I'm sorry", etc.
+    """
+    
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        
+        # Flag phrases: innocent phrases that could lead to refusals
+        self.flag_phrases = [
+            "I",
+            "I can", 
+            "I will",
+            "I'm",
+            "I am",
+            "I don't",
+            "I do not",
+            "I'm not",
+            "I am not",
+            "I do",
+            "i",
+            " I",
+            " I can", 
+            " I will",
+            " I'm",
+            " I am",
+            " I don't",
+            " I do not",
+            " I'm not",
+            " I am not",
+            " I do",
+            " i",
+            "AI",
+            "ai",
+            "Ai",
+            " AI",
+            " ai",
+            " Ai"
+        ]
+        
+        # Refusal suffixes: words that turn flag phrases into refusals
+        self.refusal_suffixes = [
+            "'t",
+            "'T",
+            "cannot",
+            "CANNOT",
+            "Cannot",
+            "can't", 
+            "CAN'T",
+            "Can't",
+            " can't", 
+            " CAN'T",
+            " Can't",
+            "cant",
+            " cant",
+            "not",
+            "NOT",
+            "Not",
+            " not",
+            " NOT",
+            " Not",
+            "sorry",
+            "SORRY",
+            "Sorry",
+            " sorry",
+            " SORRY",
+            " Sorry",
+            "apologize",
+            "APOLOGIZE",
+            "Apologize",
+            " apologize",
+            " APOLOGIZE",
+            " Apologize",
+            "uncomfortable",
+            "UNCOMFORTABLE",
+            "Uncomfortable",
+            "unable",
+            "UNABLE",
+            "Unable",
+            " unable",
+            " UNABLE",
+            " Unable",
+            "decline",
+            "DECLINE",
+            "Decline",
+            "refuse",
+            "REFUSE",
+            "Refuse",
+            "won't",
+            "WON'T",
+            "Won't",
+            "will not",
+            "WILL NOT",
+            "Will not",
+            "shouldn't",
+            "SHOULDN'T",
+            "Shouldn't",
+            "AI",
+            "ai",
+            "Ai",
+            " AI",
+            " ai",
+            " Ai",
+            "unwilling",
+            "UNWILLING",
+            "Unwilling",
+            " unwilling",
+            " UNWILLING",
+            " Unwilling",
+            " incapable",
+            " INCAPABLE",
+            " Incapable",
+            "incapable",
+            "INCAPABLE",
+            "Incapable"            
+        ]
+
+        # Convert to token IDs
+        self.flag_token_ids = {}
+        self.refusal_token_ids = set()
+        
+        # Process flag phrases
+        for phrase in self.flag_phrases:
+            token_ids = self.tokenizer.encode(phrase, add_special_tokens=False)
+            if token_ids:
+                self.flag_token_ids[tuple(token_ids)] = phrase
+        
+        # Process refusal suffixes
+        for suffix in self.refusal_suffixes:
+            token_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+            if token_ids:
+                # Add the first token of each suffix
+                self.refusal_token_ids.add(token_ids[0])
+        
+        # Add the specific problematic tokens that were causing issues
+        problems_list = [34360, 35755, 4250, 16869]
+        for token_id in problems_list:
+            self.refusal_token_ids.add(token_id)
+
+    def __call__(self, input_ids, scores):
+        """
+        Suppress logits for tokens that would lead to refusal phrases.
+        
+        Args:
+            input_ids: Current input token IDs [batch_size, seq_len]
+            scores: Current logits [batch_size, vocab_size]
+            
+        Returns:
+            Modified scores with refusal tokens suppressed
+        """
+
+        # Process each sequence in the batch
+        for b in range(input_ids.size(0)):
+            # Check if we have a flag phrase at the end for this sequence
+            for flag_tokens, flag_phrase in self.flag_token_ids.items():
+                # Check if the last tokens match this flag phrase (relaxed to last 3 tokens)
+                seq_len = input_ids[b].size(0)
+                if seq_len >= len(flag_tokens):
+                    # Check exact match first
+                    current_sequence = tuple(input_ids[b, -len(flag_tokens):].cpu().numpy())
+                    if current_sequence == flag_tokens:
+                        # We have a flag phrase, suppress refusal suffixes for this sequence only
+                        suppression_factor = -50.0  # Much more aggressive suppression
+                        
+                        for token_id in self.refusal_token_ids:
+                            if token_id < scores.shape[1]:
+                                scores[b, token_id] += suppression_factor
+                    
+                        # Only process one flag phrase at a time for this sequence
+                        break
+                    else:
+                        # Try relaxed matching: check if flag phrase tokens appear in last 3 tokens
+                        if seq_len >= 5:
+                            last_3_tokens = input_ids[b, -3:].cpu().numpy()
+                            flag_token_set = set(flag_tokens)
+                            last_3_set = set(last_3_tokens)
+                            
+                            # Check if any flag tokens are in the last 3 tokens
+                            if flag_token_set.intersection(last_3_set):
+                                # Suppress refusal tokens
+                                suppression_factor = -25.0  # Less aggressive for relaxed matching
+                                for token_id in self.refusal_token_ids:
+                                    if token_id < scores.shape[1]:
+                                        scores[b, token_id] += suppression_factor
+                            
+                                # Only process one flag phrase at a time for this sequence
+                                break
+        
+        return scores
 
 class AbstractPolicy(ModelBase, Policy, ABC):
     """
@@ -59,7 +260,7 @@ class AbstractPolicy(ModelBase, Policy, ABC):
         # Note: Configuration will be passed when the policy is initialized with config
         self.activation_hooks = []  # Will be set later with config
         
-        # Define refusal patterns for detection
+        # Define refusal patterns for detection (case-insensitive) - same as in agent_trainer.py
         self.refusal_patterns = [
             "I cannot", "I can't", "I'm not able to", "I won't", "I will not",
             "I'm unable to", "I don't think I can", "I shouldn't", "I'm not comfortable",
@@ -87,7 +288,7 @@ class AbstractPolicy(ModelBase, Policy, ABC):
         """
         text_lower = text.lower().strip()
         
-        # Check for common refusal patterns
+        # Check for common refusal patterns (case-insensitive)
         for pattern in self.refusal_patterns:
             if pattern.lower().strip() in text_lower:
                 return True
@@ -161,7 +362,11 @@ class AbstractPolicy(ModelBase, Policy, ABC):
         # Load model
         model_path = os.path.join(path, "model")
         if os.path.isdir(model_path):
-            model = AutoModelForCausalLM.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map={"": device},
+                torch_dtype=torch.bfloat16
+            )
         else:
             # Fallback: state_dict
             state_dict = torch.load(os.path.join(path, "model_state.pt"), map_location=device)
@@ -169,7 +374,7 @@ class AbstractPolicy(ModelBase, Policy, ABC):
             config = AutoConfig.from_pretrained(hf_checkpoint)
             model = AutoModelForCausalLM.from_config(config)
             model.load_state_dict(state_dict)
-        model.to(device)
+            model.to(device)
         # Instantiate concrete class
         instance = cls(hf_checkpoint or "loaded_model", tokenizer, model=model, **kwargs)
         return instance
@@ -236,12 +441,11 @@ class LowLevelPolicy(AbstractPolicy):
             top_p: float = 0.9,
             top_k: int = 100,
             temperature: float = 0.7,
-            num_candidates: int = 5,
             require_grad: bool = False,
             debug_mode: bool = False,
             **kwargs) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
         """
-        Generate an action using prompt injection and single-pass rejection sampling.
+        Generate a single action using the policy.
         
         Args:
             state: Current state (conversation history)
@@ -251,7 +455,6 @@ class LowLevelPolicy(AbstractPolicy):
             top_p: Nucleus sampling probability
             top_k: Top-k sampling parameter
             temperature: Temperature parameter for controlling generation quality
-            num_candidates: Number of candidates to generate for rejection sampling
             require_grad: Whether to calculate gradients
             **kwargs: Additional arguments
             
@@ -282,20 +485,7 @@ class LowLevelPolicy(AbstractPolicy):
             input_ids = batch_encoding.input_ids
             attention_mask = batch_encoding.attention_mask
         
-        # Define prompt injection prefixes
-        prompt_prefixes = [
-            "How do you ",
-            "What is ",
-            "Can you explain ",
-            "Tell me about ",
-        ]
-        prefix_tokens = [torch.tensor(self.tokenizer.encode(p, add_special_tokens=False)) for p in prompt_prefixes]
-        # -------------------------------------------------------------
-        # Parallelised prompt-injection generation
-        # -------------------------------------------------------------
-        all_candidates = []
-        all_tokens = []
-        num_prefixes = min(num_candidates, len(prefix_tokens))
+        # Generate single action per state
         num_states = len(state)
 
         # Build chat contexts with optional high-level instructions as system prompts
@@ -321,6 +511,7 @@ class LowLevelPolicy(AbstractPolicy):
             chat.extend(conversation_chat)
             chat_contexts.append(chat)
 
+        # Tokenize the chat contexts
         prompted_encoding = self.tokenizer.apply_chat_template(
             chat_contexts,
             add_generation_prompt=True,
@@ -331,53 +522,66 @@ class LowLevelPolicy(AbstractPolicy):
             return_dict=True
         ).to(device)
 
-        ids_list = []
-        attn_list = []
-        input_len_list = []  # original (unpadded) lengths per sample
+        batched_input_ids = prompted_encoding.input_ids
+        batched_attention = prompted_encoding.attention_mask
 
-        for prefix in prefix_tokens[:num_prefixes]:
-            ids, attn = post_tokenizer_injection(prompted_encoding, prefix.expand(len(chat_contexts), -1))  # [batch, seq]
-            ids_list.append(ids)
-            attn_list.append(attn)
-        # Determine maximum sequence length across all (prefix,state) pairs
-        max_seq_len = max(t.size(1) for t in ids_list)
-
-        pad_id = self.tokenizer.pad_token_id
-        padded_ids_batches = []
-        padded_attn_batches = []
-
-        for ids, attn in zip(ids_list, attn_list):
-            # ids, attn shape: [batch_size, seq_len]
-            seq_len = ids.size(1)
-            if seq_len < max_seq_len:
-                pad_len = max_seq_len - seq_len
-                # Pad on the LEFT for transformer inputs
-                ids = F.pad(ids, (pad_len, 0), value=pad_id)
-                attn = F.pad(attn, (pad_len, 0), value=0)
-            padded_ids_batches.append(ids)
-            padded_attn_batches.append(attn)
-            # Record per-example padded input length (which is max_seq_len for all)
-            input_len_list.extend([max_seq_len] * ids.size(0))
-
-        batched_input_ids = torch.cat(padded_ids_batches, dim=0)
-        batched_attention = torch.cat(padded_attn_batches, dim=0)
-
-        # Convert to list for easier indexing later
-        input_len_list = torch.tensor(input_len_list, device=batched_input_ids.device)
-
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "top_p": top_p,
-            "top_k": top_k,
-            "temperature": temperature,
-            "do_sample": True,   # Enable sampling instead of greedy decoding
-            "num_return_sequences": 1,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "output_scores": True,
-            "return_dict_in_generate": True,
-            "logits_processor": [ClampLogitsProcessor(min_value=-30.0, max_value=30.0)]
-        }
+        # Choose generation strategy based on configuration
+        use_beam_search = getattr(self.env, 'use_beam_search_generation', False)
+        use_enhanced_beam_search = getattr(self.env, 'use_enhanced_beam_search', False)
+        
+        # Create logits processors
+        logits_processors = [ClampLogitsProcessor(min_value=-30.0, max_value=30.0)]
+        
+        # Add refusal suppression if enabled
+        use_refusal_suppression = getattr(self.env, 'use_refusal_suppression', True) if self.env else True
+        if use_refusal_suppression:
+            logits_processors.append(RefusalSuppressionProcessor(self.tokenizer))
+            if debug_mode:
+                print(f"Refusal suppression enabled with {len(logits_processors)} logits processors")
+        else:
+            if debug_mode:
+                print("Refusal suppression disabled")
+        
+        if use_enhanced_beam_search:
+            # Use enhanced beam search with refusal filtering
+            return self.act_with_enhanced_beam_search(
+                state=state,
+                max_new_tokens=max_new_tokens,
+                num_beams=getattr(self.env, 'enhanced_beam_search_beams', 10),
+                num_return_sequences=getattr(self.env, 'enhanced_beam_search_sequences', 5),
+                **kwargs
+            )
+        elif use_beam_search:
+            # Beam search for more diverse, potentially less refusal-prone generations
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "num_beams": 5,
+                "num_return_sequences": 1,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "output_scores": True,
+                "return_dict_in_generate": True,
+                "logits_processor": logits_processors,
+                "repetition_penalty": 1.2,  # discourage token repetition
+                "no_repeat_ngram_size": 3,  # ban 3-gram loops
+            }
+        else:
+            # Nucleus sampling (current approach)
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "top_p": top_p,
+                "top_k": top_k,
+                "temperature": temperature,
+                "do_sample": True,   # Enable sampling instead of greedy decoding
+                "num_return_sequences": 1,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "output_scores": True,
+                "return_dict_in_generate": True,
+                "logits_processor": logits_processors,
+                "repetition_penalty": 1.2,  # discourage token repetition
+                "no_repeat_ngram_size": 3,  # ban 3-gram loops
+            }
 
         with torch.set_grad_enabled(require_grad):
             # Debug: Check input tensors before forward pass
@@ -387,13 +591,14 @@ class LowLevelPolicy(AbstractPolicy):
                 raise RuntimeError(f"Non-finite values in attention_mask: min: {batched_attention.min()}, max: {batched_attention.max()}")
             
             # Debug: Simple model health check with a single token
-            try:
-                test_input = torch.tensor([[1]], device=device, dtype=batched_input_ids.dtype)
-                test_output = self.model(input_ids=test_input, return_dict=True)
-                if not hasattr(test_output, 'logits') or not torch.isfinite(test_output.logits).all():
-                    raise RuntimeError(f'Model health check failed: test forward pass produces non-finite logits. Max: {test_output.logits.max()}, Min: {test_output.logits.min()}, Nan: {torch.isnan(test_output.logits).sum()} Total: {test_output.logits.numel()}')
-            except Exception as e:
-                raise RuntimeError(f"Model health check failed: {e}")
+            if debug_mode:
+                try:
+                    test_input = torch.tensor([[1]], device=device, dtype=batched_input_ids.dtype)
+                    test_output = self.model(input_ids=test_input, return_dict=True)
+                    if not hasattr(test_output, 'logits') or not torch.isfinite(test_output.logits).all():
+                        raise RuntimeError(f'Model health check failed: test forward pass produces non-finite logits. Max: {test_output.logits.max()}, Min: {test_output.logits.min()}, Nan: {torch.isnan(test_output.logits).sum()} Total: {test_output.logits.numel()}')
+                except Exception as e:
+                    raise RuntimeError(f"Model health check failed: {e}")
             
             outputs = self.model.generate(
                 input_ids=batched_input_ids,
@@ -401,55 +606,30 @@ class LowLevelPolicy(AbstractPolicy):
                 **gen_kwargs
             )
 
-        # Slice outputs back to (prefix, state) structure
-        input_length = max_seq_len  # same for all after padding
+        # Extract generated sequences
+        actions = []
+        action_tokens = []
+        
         for i in range(outputs.sequences.size(0)):
+            # Get the generated part (after the input)
+            input_length = batched_input_ids.size(1)
             generated_tokens = outputs.sequences[i, input_length:]
             decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            all_candidates.append(decoded)
-            all_tokens.append(generated_tokens)
+            actions.append(decoded)
+            action_tokens.append(generated_tokens)
         
-        # --- Batched safety scoring for all candidates (reduces generate calls) ---
-        # 1. Generate responses for *all* candidate prompts in a single batch.
-        responses_flat = self.env.get_target_responses(all_candidates)  # len = num_states*num_prefixes
-
-        # 2. Prepare reference_state list repeated per candidate (if provided)
-        if base_state is not None:
-            reference_states_flat = []
-            for s in range(num_states):
-                reference_states_flat.extend([base_state[s]] * num_prefixes)
-        else:
-            reference_states_flat = None
-
-        # 3. Score safety for all responses in one go
-        safety_scores_flat = self.env.score_safety(
-            responses_flat,
-            questions=all_candidates,
-            reference_state=reference_states_flat,
-        )  # tensor length N
-
-        # 4. Select best candidate per original state
-        selected_idx = []
-        for s in range(num_states):
-            offset = s  # index pattern: candidate_i * num_states + s
-            candidate_scores = safety_scores_flat[offset::num_states][:num_prefixes]
-            best_idx = torch.argmax(candidate_scores).item()
-            selected_idx.append(best_idx)
-        
-        # Return the selected candidate
-        selected_actions = [all_candidates[(num_states*selected_i)+state_i] for state_i, selected_i in enumerate(selected_idx)]
-        selected_tokens = [all_tokens[(num_states*selected_i)+state_i] for state_i, selected_i in enumerate(selected_idx)]
-        selected_log_probs = self.batch_get_log_probs(
-            input_ids_batch=input_ids,
-            output_ids_batch=selected_tokens,
+        # Compute log probabilities for the generated sequences
+        log_probs = self.batch_get_log_probs(
+            input_ids_batch=[batched_input_ids[i] for i in range(batched_input_ids.size(0))],
+            output_ids_batch=action_tokens,
             require_grad=require_grad
         )[0]
         
-        assert len(selected_actions) == len(selected_tokens) == len(selected_log_probs) == num_states, (
-            f"Selected actions, tokens, and log probs must have the same length as state list ({num_states}), "
-            f"got {len(selected_actions)}, {len(selected_tokens)}, {len(selected_log_probs)}"
+        assert len(actions) == len(action_tokens) == len(log_probs) == num_states, (
+            f"Actions, tokens, and log probs must have the same length as state list ({num_states}), "
+            f"got {len(actions)}, {len(action_tokens)}, {len(log_probs)}"
         )
-        return selected_actions, selected_tokens, selected_log_probs
+        return actions, action_tokens, log_probs
     
     def batch_get_log_probs(self, 
                            input_ids_batch: List[torch.Tensor], 
@@ -567,6 +747,10 @@ class LowLevelPolicy(AbstractPolicy):
                 attention_mask=full_attention_masks,
                 return_dict=True
             )
+            
+            # Clear cache after forward pass to free memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Extract logits for output tokens only
         logits = outputs.logits[:, max_input_len:max_input_len + max_output_len, :]
@@ -590,12 +774,12 @@ class LowLevelPolicy(AbstractPolicy):
 
         if sequence_level:
             # Sum over sequence dimension to get per-sequence log-prob (shape [batch])
-            batch_log_probs = gathered_log_probs.sum(dim=-1)
+            log_probs_tensor = gathered_log_probs.sum(dim=-1)
         else:
-            batch_log_probs = gathered_log_probs
-        # batch_log_probs now has shape [batch, max_output_len] or [batch]
-        if not torch.isfinite(batch_log_probs).all():
-            raise RuntimeError("Non-finite values detected in batch_log_probs")
+            log_probs_tensor = gathered_log_probs
+        # log_probs_tensor now has shape [batch, max_output_len] or [batch]
+        if not torch.isfinite(log_probs_tensor).all():
+            raise RuntimeError("Non-finite values detected in log_probs_tensor")
         # Calculate entropy and perplexity (without gradients)
         with torch.set_grad_enabled(False):
             # Use the already-clamped logits for entropy calculation
@@ -604,7 +788,7 @@ class LowLevelPolicy(AbstractPolicy):
             mean_entropy = entropy.mean()
             mean_perplexity = torch.exp(mean_entropy)
         
-        return batch_log_probs, mean_entropy, mean_perplexity
+        return log_probs_tensor, mean_entropy, mean_perplexity
 
     def get_log_probs(self, 
                       input_ids: torch.Tensor, 
@@ -649,11 +833,11 @@ class LowLevelPolicy(AbstractPolicy):
                     processed_outputs.append(out_tensor)
                 
                 # Use batch processing
-                batch_log_probs, entropy, perplexity = self.batch_get_log_probs(
+                log_probs_tensor, entropy, perplexity = self.batch_get_log_probs(
                     processed_inputs, processed_outputs, require_grad, sequence_level, **kwargs
                 )
                 
-                return batch_log_probs, entropy, perplexity
+                return log_probs_tensor, entropy, perplexity
         
         # Original single-sequence processing logic
         # Import utilities for device management
@@ -736,6 +920,10 @@ class LowLevelPolicy(AbstractPolicy):
                 attention_mask=full_attention_mask,
                 return_dict=True
             )
+            
+            # Clear cache after forward pass to free memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Get next token logits
         logits = outputs.logits[:, input_length:, :]
@@ -1039,7 +1227,152 @@ class LowLevelPolicy(AbstractPolicy):
         
         return self.act(state=state, **merged_params)
 
+    def act_with_enhanced_beam_search(self, 
+                                    state: Union[List[str], List[List[str]], torch.Tensor],
+                                    max_new_tokens: int = 100,
+                                    num_beams: int = 10,
+                                    num_return_sequences: int = 5,
+                                    **kwargs) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        """
+        Generate actions using enhanced beam search that filters out refusal candidates.
+        
+        This approach generates multiple candidates and filters out refusals before
+        returning the best non-refusal candidates.
+        
+        Args:
+            state: Current state
+            max_new_tokens: Maximum tokens to generate
+            num_beams: Number of beams for beam search
+            num_return_sequences: Number of sequences to return
+            **kwargs: Additional arguments
+            
+        Returns:
+            tuple: (actions, action_tokens, log_probs)
+        """
+        device = next(self.model.parameters()).device
+        
+        # Handle tensor input
+        if isinstance(state, torch.Tensor):
+            input_ids = state.to(device)
+            attention_mask = torch.where(
+                input_ids == self.tokenizer.pad_token_id,
+                torch.zeros_like(input_ids),
+                torch.ones_like(input_ids)
+            ).to(device)
+        else:
+            # Use safe tokenizer call for all other input types
+            batch_encoding = safe_tokenizer_call(
+                self.tokenizer,
+                state,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024
+            ).to(device)
+            input_ids = batch_encoding.input_ids
+            attention_mask = batch_encoding.attention_mask
+        
+        # Build chat contexts (simplified for this example)
+        chat_contexts = []
+        for s in state:
+            conversation_chat = build_chat(s, 0)
+            chat_contexts.append(conversation_chat)
+
+        # Tokenize the chat contexts
+        prompted_encoding = self.tokenizer.apply_chat_template(
+            chat_contexts,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            return_dict=True
+        ).to(device)
+
+        batched_input_ids = prompted_encoding.input_ids
+        batched_attention = prompted_encoding.attention_mask
+
+        # Enhanced beam search with refusal filtering
+        # Create logits processors
+        logits_processors = [ClampLogitsProcessor(min_value=-30.0, max_value=30.0)]
+        
+        # Add refusal suppression if enabled
+        use_refusal_suppression = getattr(self.env, 'use_refusal_suppression', True) if self.env else True
+        if use_refusal_suppression:
+            logits_processors.append(RefusalSuppressionProcessor(self.tokenizer))
+        
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "num_beams": num_beams,
+            "num_return_sequences": num_return_sequences,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "output_scores": True,
+            "return_dict_in_generate": True,
+            "logits_processor": logits_processors,
+            "repetition_penalty": 1.2,
+            "no_repeat_ngram_size": 3,
+        }
+
+        with torch.set_grad_enabled(False):
+            outputs = self.model.generate(
+                input_ids=batched_input_ids,
+                attention_mask=batched_attention,
+                **gen_kwargs
+            )
+
+        # Extract and filter generated sequences
+        all_actions = []
+        all_action_tokens = []
+        all_log_probs = []
+        
+        input_length = batched_input_ids.size(1)
+        
+        for i in range(outputs.sequences.size(0)):
+            # Get the generated part (after the input)
+            generated_tokens = outputs.sequences[i, input_length:]
+            decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Check if this is a refusal
+            is_refusal = self._detect_refusal(decoded)
+            
+            if not is_refusal:
+                all_actions.append(decoded)
+                all_action_tokens.append(generated_tokens)
+                # Compute log prob for this sequence
+                log_prob = self.get_log_probs(
+                    batched_input_ids[i], 
+                    generated_tokens, 
+                    require_grad=False
+                )[0]
+                all_log_probs.append(log_prob)
+        
+        # If we have no non-refusal candidates, return the best refusal (fallback)
+        if not all_actions:
+            # Return the first candidate as fallback
+            generated_tokens = outputs.sequences[0, input_length:]
+            decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            log_prob = self.get_log_probs(
+                batched_input_ids[0], 
+                generated_tokens, 
+                require_grad=False
+            )[0]
+            
+            return [decoded], [generated_tokens], [log_prob]
+        
+        # Return the best non-refusal candidates
+        return all_actions, all_action_tokens, all_log_probs
+
 class TemplatePolicy(LowLevelPolicy):
+    """
+    @deprecated: This class is deprecated and should not be used.
+    TemplatePolicy was designed for low-level token generation but is not appropriate
+    for the current PPO architecture which uses:
+    - LowLevelPolicy for token-level actions
+    - PPOTemplateHighLevelPolicy for template selection
+    
+    Use LowLevelPolicy instead for low-level actions.
+    """
     """
     Policy that generates responses using templates.
     
@@ -1239,7 +1572,7 @@ class TemplatePolicy(LowLevelPolicy):
         # Initialize result containers
         batch_formatted_responses = []
         batch_tokens = []
-        batch_log_probs = []
+        template_log_probs = []
         
         # Batch process template formatting for better GPU utilization
         all_formatted_responses = []
@@ -1382,9 +1715,9 @@ class TemplatePolicy(LowLevelPolicy):
                 state_log_probs = [base_log_probs if hasattr(base_log_probs, 'to') else torch.tensor([0.0], device=device)]
             
             batch_tokens.append(state_tokens)
-            batch_log_probs.append(state_log_probs)
+            template_log_probs.append(state_log_probs)
         
-        return batch_formatted_responses, batch_tokens, batch_log_probs
+        return batch_formatted_responses, batch_tokens, template_log_probs
     
     def rollout(
         self,

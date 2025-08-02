@@ -16,7 +16,7 @@ class TrainingConfig:
     """Configuration for training parameters."""
     
     # Learning parameters
-    lr: float = 5e-5
+    lr: float = 1e-4
     value_lr: float = 1e-3
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -36,7 +36,7 @@ class TrainingConfig:
     kl_coef: float = 0.01
     adv_coef: float = 0.1
     sem_coef: float = 0.1
-    perplexity_coef: float = 0.01
+    perplexity_coef: float = 0.1
     
     # Randomization
     seed: Optional[int] = None
@@ -48,11 +48,21 @@ class TrainingConfig:
     # Output settings
     output_dir: str = "outputs"
     
+    # Checkpoint loading
+    load_from_checkpoint: Optional[str] = None  # Directory to load checkpoint from
+    force_checkpoint_loading: bool = False  # If True, continue training even if some models are missing from checkpoint
+    
     # PPO specific settings
     normalize_advantages: bool = True
     max_grad_norm: float = 1.0
     target_kl: Optional[float] = 0.01
     use_gae: bool = True
+    
+    # Learning rate scheduling
+    use_linear_annealing: bool = True
+    annealing_start_factor: float = 1.0
+    annealing_end_factor: float = 0.1
+    annealing_warmup_episodes: int = 10
     
     # Distributed training
     use_accelerate: bool = True
@@ -87,10 +97,18 @@ class TrainingConfig:
     num_masked_marginal_tokens: int = 3
     # Whether to additionally compute pairwise marginal masking among the selected top-K tokens
     pairwise_marginal_masking: bool = False
+    # NEW: If True, choose the second token in pairwise masking uniformly at random instead of exhaustively enumerating all pairs.
+    uniform_pairwise_selection: bool = False
+    # NEW: Number of random secondary tokens to sample per primary token when uniform_pairwise_selection is enabled.
+    num_uniform_pair_samples: int = 1
 
     # If true, compute marginal rewards as Q_high(s, a_full) - Q_high(s, a_masked) using the current sequence
     # critic predictions, instead of R(s') - R(a) from the environment. Useful for ablation.
     Q_as_reward: bool = False
+    
+    # If true, use R(s') - R(a) formula for critic targets, where R(s') is target response safety
+    # and R(a) is agent action safety. If false, use only R(a) (original behavior).
+    use_rs_minus_ra_reward: bool = True
 
     # Memory optimization settings
     dynamic_batch_sizing: bool = False
@@ -121,6 +139,9 @@ class TrainingConfig:
     # Memory optimization for marginal reward computation
     max_marginal_token_positions: int = 10  # Maximum number of token positions to process for marginal rewards
 
+    # Whether to use naïve back-to-front γ-decayed per-token rewards instead of marginal masking
+    naive_decayed_token_reward: bool = False
+
 
 @dataclass
 class ModelConfig:
@@ -132,7 +153,15 @@ class ModelConfig:
     
     # Generation parameters
     action_branches: int = 3  # Number of actions to generate per state
-    rejection_candidates: int = 8  # Number of rejection sampling candidates
+    rejection_candidates: int = 6  # Number of rejection sampling candidates
+    
+    # Rejection sampling configuration
+    use_combined_rejection_scoring: bool = True  # Whether to use combined v_high + perplexity scoring
+    use_perplexity_only: bool = False  # Whether to use only perplexity for rejection sampling (overrides use_combined_rejection_scoring)
+    perplexity_start_weight: float = 1.0  # Starting weight for perplexity score (v_high gets 1 - perplexity_weight)
+    perplexity_end_weight: float = 0.4  # Final weight for perplexity score after annealing
+    perplexity_decay_episodes: int = 100  # Number of episodes to decay perplexity weight from start to end
+
     
     # High-level policy configuration
     use_high_level_policy: bool = False
@@ -146,8 +175,8 @@ class ModelConfig:
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
-    target_layers: List[int] = field(default_factory=lambda: [0, 1, 2])
+    target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    target_layers: List[int] = field(default_factory=lambda: list(range(10,24)))
     
     # Target model settings
     target_model: Optional[str] = None
@@ -182,6 +211,19 @@ class ModelConfig:
     enable_forward_hooks: bool = False  # Whether to attach activation clamping hooks
     forward_hook_clamp_range: float = 30.0  # Clamp range for activation hooks (-range to +range)
     forward_hook_layernorm_range: float = 10.0  # Clamp range for LayerNorm hooks (-range to +range)
+    
+
+    
+    # Generation strategy for low-level agent
+    use_beam_search_generation: bool = False  # True: beam search, False: nucleus sampling
+    
+    # Refusal suppression during generation
+    use_refusal_suppression: bool = True  # Whether to suppress refusal tokens during generation
+    
+    # Enhanced beam search for refusal filtering
+    use_enhanced_beam_search: bool = False  # Whether to use enhanced beam search with refusal filtering
+    enhanced_beam_search_beams: int = 10  # Number of beams for enhanced beam search
+    enhanced_beam_search_sequences: int = 5  # Number of sequences to return from enhanced beam search
 
     # High-level policy type selection
     high_level_policy_type: str = "dqn"  # "dqn", "ppo", "llm", or "hybrid"
@@ -202,6 +244,19 @@ class ModelConfig:
     hybrid_context_framing_enabled: bool = True
     hybrid_complexity_modification_enabled: bool = True
     hybrid_combination_probability: float = 0.7
+    
+    # Template and perspective configuration
+    templates_path: str = "src/configs/templates.json"
+    scorecard_path: str = "scorecard.json"
+
+    # DQN configuration (for TemplateHighLevelPolicy)
+    epsilon_start: float = 1.0  # Starting value for epsilon-greedy exploration
+    epsilon_end: float = 0.05   # Final value for epsilon-greedy exploration
+    epsilon_decay: int = 1000   # Number of steps over which to decay epsilon
+    replay_size: int = 1000     # Size of replay buffer
+    dqn_batch_size: int = 32    # Batch size for DQN updates
+    target_update_freq: int = 100  # How often to update target network
+    dqn_gamma: float = 0.99     # Discount factor for DQN
 
 
 @dataclass
@@ -235,6 +290,11 @@ class EnvironmentConfig:
     use_custom_reward: bool = False
     reward_model_path: Optional[str] = None
     
+    # White-box reward components
+    similarity_weight: float = 0.1  # Weight for embedding similarity in reward calculation
+    
+
+    
     # Optional memory budget hints for very large target / guard models
     target_max_gpu_memory: Optional[str] = None
     guard_max_gpu_memory: Optional[str] = None
@@ -258,58 +318,60 @@ class AgentConfig:
     VALID_ALGS: ClassVar[List[str]] = ["ppo", "reinforce", "ppo-pretrain"]
     VALID_ATTACK_TYPES: ClassVar[List[str]] = ["standard", "breakdown"]
     
-    def __post_init__(self):
-        """Validate configuration after initialization."""
-        self._validate()
+    # Validation constants
+    VALID_HIGH_LEVEL_POLICY_TYPES: ClassVar[List[str]] = ["dqn", "ppo", "llm", "hybrid"]
+
     
-    def _validate(self) -> None:
-        """Validate configuration values."""
-        # Validate algorithm
+    def __post_init__(self):
+        """Validate configuration parameters."""
         if self.training.alg not in self.VALID_ALGS:
             raise ValueError(f"Invalid algorithm: {self.training.alg}. Must be one of {self.VALID_ALGS}")
         
-        # Validate attack type
         if self.training.attack_type not in self.VALID_ATTACK_TYPES:
             raise ValueError(f"Invalid attack type: {self.training.attack_type}. Must be one of {self.VALID_ATTACK_TYPES}")
         
-        # Validate batch sizes
-        if self.training.batch_size < self.training.minibatch_size:
-            self.training.minibatch_size = self.training.batch_size
-            print(f"Batch size ({self.training.batch_size}) should be >= minibatch size ({self.training.minibatch_size}). Setting minibatch size to batch size.")
+        if self.model.high_level_policy_type not in self.VALID_HIGH_LEVEL_POLICY_TYPES:
+            raise ValueError(f"Invalid high-level policy type: {self.model.high_level_policy_type}. Must be one of {self.VALID_HIGH_LEVEL_POLICY_TYPES}")
         
-        # Validate data path - support both files and directories
-        if not os.path.exists(self.environment.data_path):
-            raise FileNotFoundError(f"Data path not found: {self.environment.data_path}")
+
         
-        # If path is a directory, check if it contains required files
-        if os.path.isdir(self.environment.data_path):
-            has_data_files = False
-            for root, _, files in os.walk(self.environment.data_path):
-                for file in files:
-                    if file.endswith('.json') or file.endswith('.jsonl') or file.endswith('.csv'):
-                        has_data_files = True
-                        break
-                if has_data_files:
-                    break
-            
-            if not has_data_files:
-                raise FileNotFoundError(f"No JSON, JSONL, or CSV files found in directory: {self.environment.data_path}")
+        if self.training.batch_size <= 0:
+            raise ValueError("Batch size must be positive")
         
-        # Validate custom reward model path if used
-        if self.environment.use_custom_reward and self.environment.reward_model_path:
-            if not os.path.exists(self.environment.reward_model_path):
-                raise FileNotFoundError(f"Reward model path not found: {self.environment.reward_model_path}")
+        if self.training.minibatch_size <= 0:
+            raise ValueError("Minibatch size must be positive")
         
-        # Ensure rollout_steps positive
+        if self.training.minibatch_size > self.training.batch_size:
+            raise ValueError("Minibatch size cannot be larger than batch size")
+        
         if self.training.rollout_steps <= 0:
-            raise ValueError("rollout_steps must be positive")
+            raise ValueError("Rollout steps must be positive")
+        
+        if self.training.episodes <= 0:
+            raise ValueError("Episodes must be positive")
+        
+        if self.training.lr <= 0:
+            raise ValueError("Learning rate must be positive")
+        
+        if self.training.value_lr <= 0:
+            raise ValueError("Value learning rate must be positive")
 
-        # NEW: Validate warmup rollout and bandwidth settings
-        if self.training.warmup_rollout_steps <= 0:
-            raise ValueError("warmup_rollout_steps must be positive")
-
-        if self.environment.warmup_max_new_tokens <= 0:
-            raise ValueError("warmup_max_new_tokens must be positive")
+        # ------------------------------------------------------------------
+        # Mutual exclusivity check for marginal masking options
+        # ------------------------------------------------------------------
+        if self.training.pairwise_marginal_masking and self.training.uniform_pairwise_selection:
+            raise ValueError(
+                "Configuration error: 'pairwise_marginal_masking' and 'uniform_pairwise_selection' "
+                "cannot both be True. Please enable at most one of these options."
+            )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary."""
+        return {
+            "training": asdict(self.training),
+            "model": asdict(self.model),
+            "environment": asdict(self.environment)
+        }
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'AgentConfig':
@@ -394,31 +456,6 @@ class AgentConfig:
         with open(json_path, 'r') as f:
             config_dict = json.load(f)
         return cls.from_dict(config_dict)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert configuration to dictionary.
-        
-        Returns:
-            Dictionary representation
-        """
-        result = {
-            'override': self.override
-        }
-        
-        # Add training config
-        for k, v in asdict(self.training).items():
-            result[k] = v
-            
-        # Add model config
-        for k, v in asdict(self.model).items():
-            result[k] = v
-            
-        # Add environment config
-        for k, v in asdict(self.environment).items():
-            result[k] = v
-            
-        return result
     
     def save(self, path: str) -> None:
         """

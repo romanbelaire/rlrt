@@ -18,8 +18,8 @@ from transformers import (
 )
 import os
 
-from base import Critic, ModelBase
-from utils import apply_activation_clamping
+from src.base import Critic, ModelBase
+from src.utils import apply_activation_clamping
 
 class AbstractValueCritic(ModelBase, Critic, ABC):
     """
@@ -187,10 +187,6 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
                     # For models with a 'model' attribute (like LlamaForCausalLM)
                     transformer_outputs = self.model.model(
                         *args,
-                        output_hidden_states=True,
-                        output_attentions=return_attention,
-                        return_dict=True,
-                        use_cache=False,
                         **kwargs
                     )
                 else:
@@ -198,10 +194,6 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
                     # This is a fallback and may not work for all model architectures
                     transformer_outputs = self.model(
                         *args,
-                        output_hidden_states=True,
-                        output_attentions=return_attention,
-                        return_dict=True,
-                        use_cache=False,
                         **kwargs
                     )
                 
@@ -338,8 +330,18 @@ class SequenceLevelValueCritic(AbstractValueCritic):
         Args:
             load_path: Path to load the model from
         """
+        from src.utils import safe_load_state_dict
+        
         value_head_path = os.path.join(load_path, "sequence_value_head.pt")
-        self.value_head.load_state_dict(torch.load(value_head_path))
+        if not os.path.exists(value_head_path):
+            warnings.warn(f"Sequence value head not found at {value_head_path}. Initializing from scratch.")
+            return
+            
+        state_dict = torch.load(value_head_path)
+        success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
+        if not success:
+            raise RuntimeError(error)
+            
         print(f"Loaded sequence-level value head from {load_path}")
 
 
@@ -417,6 +419,16 @@ class TokenLevelValueCritic(AbstractValueCritic):
         Args:
             load_path: Path to load the model from
         """
+        from src.utils import safe_load_state_dict
+        
         value_head_path = os.path.join(load_path, "token_value_head.pt")
-        self.value_head.load_state_dict(torch.load(value_head_path))
+        if not os.path.exists(value_head_path):
+            warnings.warn(f"Token value head not found at {value_head_path}. Initializing from scratch.")
+            return
+            
+        state_dict = torch.load(value_head_path)
+        success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
+        if not success:
+            raise RuntimeError(error)
+            
         print(f"Loaded token-level value head from {load_path}")

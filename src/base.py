@@ -223,15 +223,26 @@ class Conversation:
         self.user_messages: List[str] = []
         self.assistant_messages: List[str] = []
         self.metadata: Dict[str, Any] = {}
+        self.high_level_instructions: List[str] = []
+        self.template_ids: List[str] = []  # Track template ID for each user message
+        self.original_harmful_prompt: Optional[str] = None
         
-    def add_user_message(self, message: str) -> None:
+    def add_user_message(self, message: str, high_level_instruction: Optional[str] = None, template_id: Optional[str] = None) -> None:
         """
         Add a user message to the conversation.
         
         Args:
             message: The user's message
+            high_level_instruction: The high-level instruction for this user message (optional)
+            template_id: The template ID used for this user message (optional)
         """
         self.user_messages.append(message)
+        # Add corresponding high-level instruction (empty string if none provided)
+        instruction = high_level_instruction if high_level_instruction is not None else ""
+        self.high_level_instructions.append(instruction)
+        # Add corresponding template ID (empty string if none provided)
+        template_id_str = template_id if template_id is not None else ""
+        self.template_ids.append(template_id_str)
         
     def add_assistant_message(self, message: str) -> None:
         """
@@ -242,44 +253,241 @@ class Conversation:
         """
         self.assistant_messages.append(message)
         
-    def add_qa_pair(self, user_message: str, assistant_message: str) -> None:
+    def add_qa_pair(self, user_message: str, assistant_message: str, high_level_instruction: Optional[str] = None, template_id: Optional[str] = None) -> None:
         """
         Add a complete Q&A pair to the conversation.
         
         Args:
             user_message: The user's message/question
             assistant_message: The assistant's response
+            high_level_instruction: The high-level instruction for this user message (optional)
+            template_id: The template ID used for this user message (optional)
         """
-        self.add_user_message(user_message)
+        self.add_user_message(user_message, high_level_instruction, template_id)
         self.add_assistant_message(assistant_message)
         
-    def get_full_conversation(self, include_roles: bool = True) -> List[str]:
+    def set_high_level_instruction(self, index: int, instruction: str) -> None:
         """
-        Get the entire conversation as an ordered list.
+        Set a high-level instruction at a specific index.
         
         Args:
-            include_roles: Whether to include role prefixes (User:, Assistant:)
+            index: Index of the instruction to set
+            instruction: The high-level instruction that guides the agent
+        """
+        # Extend the list if needed
+        while len(self.high_level_instructions) <= index:
+            self.high_level_instructions.append("")
+        self.high_level_instructions[index] = instruction
+        
+    def get_high_level_instruction(self, index: int) -> Optional[str]:
+        """
+        Get a high-level instruction at a specific index.
+        
+        Args:
+            index: Index of the instruction to get
             
         Returns:
-            List of messages in chronological order
+            The high-level instruction at that index, or None if not found
+        """
+        if 0 <= index < len(self.high_level_instructions):
+            return self.high_level_instructions[index] if self.high_level_instructions[index] else None
+        return None
+        
+    def get_high_level_instructions(self) -> List[str]:
+        """Get all high-level instructions for this conversation."""
+        return self.high_level_instructions.copy()
+        
+    def add_high_level_instruction(self, instruction: str) -> None:
+        """
+        Add a high-level instruction to the list.
+        
+        Args:
+            instruction: The high-level instruction to add
+        """
+        self.high_level_instructions.append(instruction)
+        
+    def ensure_instructions_sync(self) -> None:
+        """
+        Ensure the high_level_instructions list has the same length as user_messages.
+        Fill with empty strings if needed.
+        """
+        while len(self.high_level_instructions) < len(self.user_messages):
+            self.high_level_instructions.append("")
+        
+        # Truncate if too long (shouldn't happen normally)
+        if len(self.high_level_instructions) > len(self.user_messages):
+            self.high_level_instructions = self.high_level_instructions[:len(self.user_messages)]
+        
+    def set_original_harmful_prompt(self, prompt: str) -> None:
+        """
+        Set the original harmful prompt for this conversation.
+        
+        Args:
+            prompt: The original harmful prompt that initiated this conversation
+        """
+        self.original_harmful_prompt = prompt
+        
+    def get_original_harmful_prompt(self) -> Optional[str]:
+        """Get the original harmful prompt for this conversation."""
+        return self.original_harmful_prompt
+        
+    def get_agent_context(self) -> List[Dict[str, str]]:
+        """
+        Get conversation context for the agent (includes high-level instructions).
+        
+        For the agent:
+        - Target model messages are labeled as "user" (the agent sees target as the user)
+        - Agent messages are labeled as "assistant" (the agent sees itself as the assistant)
+        - High-level instructions are included as system messages
+        
+        Returns:
+            List of message dictionaries with 'role' and 'content' keys
+        """
+        context = []
+        
+        # Add the most recent high-level instruction if available
+        if self.high_level_instructions and len(self.high_level_instructions) > 0:
+            last_instruction = self.high_level_instructions[-1]
+            if last_instruction:  # Only add if not empty
+                context.append({
+                    'role': 'system',
+                    'content': last_instruction
+                })
+        
+        # Add conversation history with role swapping for agent context
+        max_length = max(len(self.user_messages), len(self.assistant_messages))
+        for i in range(max_length):
+            if i < len(self.user_messages):
+                # Agent messages (originally "user") become "assistant"
+                context.append({
+                    'role': 'assistant',
+                    'content': self.user_messages[i]
+                })
+                    
+            if i < len(self.assistant_messages):
+                # Target messages (originally "assistant") become "user"
+                context.append({
+                    'role': 'user',
+                    'content': self.assistant_messages[i]
+                })
+        
+        return context
+        
+    def get_target_context(self) -> List[Dict[str, str]]:
+        """
+        Get conversation context for the target model (conversation only).
+        
+        For the target model:
+        - Agent messages are labeled as "user" (target sees agent as the user)
+        - Target model messages are labeled as "assistant" (target sees itself as the assistant)
+        - No high-level instructions
+        - No original harmful prompt
+        
+        Returns:
+            List of message dictionaries with 'role' and 'content' keys
+        """
+        context = []
+        max_length = max(len(self.user_messages), len(self.assistant_messages))
+        
+        for i in range(max_length):
+            if i < len(self.user_messages):
+                # Agent messages (originally "user") stay as "user" for target
+                context.append({
+                    'role': 'user',
+                    'content': self.user_messages[i]
+                })
+                    
+            if i < len(self.assistant_messages):
+                # Target messages (originally "assistant") stay as "assistant" for target
+                context.append({
+                    'role': 'assistant',
+                    'content': self.assistant_messages[i]
+                })
+        
+        return context
+        
+    def get_agent_history(self, max_turns: Optional[int] = None) -> List[Dict[str, str]]:
+        """
+        Get conversation history for the agent in structured format.
+        
+        For the agent:
+        - Target model messages are labeled as "user" (the agent sees target as the user)
+        - Agent messages are labeled as "assistant" (the agent sees itself as the assistant)
+        - High-level instructions are included as system messages
+        
+        Args:
+            max_turns: Maximum number of turns to include (None for all)
+            
+        Returns:
+            List of dictionaries with 'role' and 'content' keys, including system messages
+        """
+        history = []
+        max_length = max(len(self.user_messages), len(self.assistant_messages))
+        
+        # Apply max_turns limit if specified
+        if max_turns is not None:
+            max_length = min(max_length, max_turns)
+        
+        # Add the most recent high-level instruction as system message if available
+        if self.high_level_instructions and len(self.high_level_instructions) > 0:
+            last_instruction = self.high_level_instructions[-1]
+            if last_instruction:  # Only add if not empty
+                history.append({
+                    'role': 'system',
+                    'content': last_instruction
+                })
+        
+        for i in range(max_length):
+            # Add agent message if available (role swapped to "assistant")
+            if i < len(self.user_messages):
+                history.append({
+                    'role': 'assistant',
+                    'content': self.user_messages[i]
+                })
+                
+            # Add target message if available (role swapped to "user")
+            if i < len(self.assistant_messages):
+                history.append({
+                    'role': 'user',
+                    'content': self.assistant_messages[i]
+                })
+        
+        return history
+        
+    def get_target_history(self, max_turns: Optional[int] = None) -> List[Dict[str, str]]:
+        """
+        Get conversation history for the target model in structured format.
+        
+        Args:
+            max_turns: Maximum number of turns to include (None for all)
+            
+        Returns:
+            List of dictionaries with 'role' and 'content' keys, no system message
+        """
+        return self.get_conversation_history(max_turns=max_turns)
+        
+    def get_full_conversation(self) -> List[Dict[str, str]]:
+        """
+        Get the entire conversation as a list of message dictionaries.
+        
+        Returns:
+            List of message dictionaries with 'role' and 'content' keys
         """
         conversation = []
         max_length = max(len(self.user_messages), len(self.assistant_messages))
         
         for i in range(max_length):
             if i < len(self.user_messages):
-                user_msg = self.user_messages[i]
-                if include_roles:
-                    conversation.append(f"User: {user_msg}")
-                else:
-                    conversation.append(user_msg)
+                conversation.append({
+                    'role': 'user',
+                    'content': self.user_messages[i]
+                })
                     
             if i < len(self.assistant_messages):
-                assistant_msg = self.assistant_messages[i]
-                if include_roles:
-                    conversation.append(f"Assistant: {assistant_msg}")
-                else:
-                    conversation.append(assistant_msg)
+                conversation.append({
+                    'role': 'assistant',
+                    'content': self.assistant_messages[i]
+                })
                     
         return conversation
         
@@ -394,6 +602,9 @@ class Conversation:
         self.user_messages.clear()
         self.assistant_messages.clear()
         self.metadata.clear()
+        self.high_level_instructions.clear()
+        self.template_ids.clear()
+        self.original_harmful_prompt = None
         
     def copy(self, new_conversation_id: Optional[str] = None) -> 'Conversation':
         """
@@ -415,6 +626,11 @@ class Conversation:
         # Copy messages
         new_conv.user_messages = self.user_messages.copy()
         new_conv.assistant_messages = self.assistant_messages.copy()
+        
+        # Copy additional fields
+        new_conv.high_level_instructions = self.high_level_instructions.copy()
+        new_conv.template_ids = self.template_ids.copy()
+        new_conv.original_harmful_prompt = self.original_harmful_prompt
         
         # Copy metadata
         new_conv.metadata = self.metadata.copy()
@@ -441,6 +657,9 @@ class Conversation:
             'conversation_id': self.conversation_id,
             'user_messages': self.user_messages.copy(),
             'assistant_messages': self.assistant_messages.copy(),
+            'high_level_instructions': self.high_level_instructions.copy(),
+            'template_ids': self.template_ids.copy(),
+            'original_harmful_prompt': self.original_harmful_prompt,
             'metadata': self.metadata.copy(),
             'created_at': getattr(self, 'created_at', None),
             'updated_at': getattr(self, 'updated_at', None)
@@ -463,12 +682,14 @@ class Conversation:
         # Create conversation data with role, text, and turn fields
         conversation_data = {
             "conversation_id": self.conversation_id,
+            "high_level_instructions": self.high_level_instructions,
+            "original_harmful_prompt": self.original_harmful_prompt,
             "metadata": self.metadata.copy(),
             "messages": []
         }
         
         # Get the full conversation as alternating messages
-        full_conversation = self.get_full_conversation(include_roles=False)
+        full_conversation = self.get_full_conversation()
         
         # Process messages with role, text, and turn information
         turn = 1
@@ -513,6 +734,9 @@ class Conversation:
         conv = cls(conversation_id=data.get('conversation_id'))
         conv.user_messages = data.get('user_messages', [])
         conv.assistant_messages = data.get('assistant_messages', [])
+        conv.high_level_instructions = data.get('high_level_instructions', [])
+        conv.template_ids = data.get('template_ids', [])
+        conv.original_harmful_prompt = data.get('original_harmful_prompt')
         conv.metadata = data.get('metadata', {})
         return conv
         
@@ -551,7 +775,75 @@ class Conversation:
         
     def __repr__(self) -> str:
         """Detailed string representation."""
-        return f"Conversation(id='{self.conversation_id}', user_msgs={len(self.user_messages)}, assistant_msgs={len(self.assistant_messages)})"
+        has_instructions = len(self.high_level_instructions) > 0
+        has_harmful_prompt = self.original_harmful_prompt is not None
+        return f"Conversation(id='{self.conversation_id}', user_msgs={len(self.user_messages)}, assistant_msgs={len(self.assistant_messages)}, instructions={len(self.high_level_instructions)}, has_harmful_prompt={has_harmful_prompt})"
+
+    def get_template_id(self, index: int) -> Optional[str]:
+        """
+        Get a template ID at a specific index.
+        
+        Args:
+            index: Index of the template ID to get
+            
+        Returns:
+            The template ID at that index, or None if not found
+        """
+        if 0 <= index < len(self.template_ids):
+            return self.template_ids[index] if self.template_ids[index] else None
+        return None
+        
+    def get_template_ids(self) -> List[str]:
+        """Get all template IDs for this conversation."""
+        return self.template_ids.copy()
+        
+    def add_template_id(self, template_id: str) -> None:
+        """
+        Add a template ID to the list.
+        
+        Args:
+            template_id: The template ID to add
+        """
+        self.template_ids.append(template_id)
+        
+    def set_template_id(self, index: int, template_id: str) -> None:
+        """
+        Set a template ID at a specific index.
+        
+        Args:
+            index: Index of the template ID to set
+            template_id: The template ID that was used for this message
+        """
+        # Extend the list if needed
+        while len(self.template_ids) <= index:
+            self.template_ids.append("")
+        self.template_ids[index] = template_id
+        
+    def get_latest_template_id(self) -> Optional[str]:
+        """
+        Get the most recent template ID from the conversation.
+        
+        Returns:
+            The most recent template ID, or None if no template IDs exist
+        """
+        if self.template_ids:
+            # Return the last non-empty template ID
+            for template_id in reversed(self.template_ids):
+                if template_id:
+                    return template_id
+        return None
+        
+    def ensure_template_ids_sync(self) -> None:
+        """
+        Ensure the template_ids list has the same length as user_messages.
+        Fill with empty strings if needed.
+        """
+        while len(self.template_ids) < len(self.user_messages):
+            self.template_ids.append("")
+        
+        # Truncate if too long (shouldn't happen normally)
+        if len(self.template_ids) > len(self.user_messages):
+            self.template_ids = self.template_ids[:len(self.user_messages)]
 
 class BaseModelSingleton:
     """
@@ -615,7 +907,10 @@ class BaseModelSingleton:
         # Multi-GPU setup with explicit targeting
         if self.prefer_gpu is not None and self.prefer_gpu < num_gpus:
             print(f"BaseModelSingleton: targeting {self.model_name} for GPU {self.prefer_gpu}")
-            return {f"": self.prefer_gpu}
+            # Place the entire model on the preferred GPU by returning an explicit device map.
+            # Using a dict avoids implicit defaulting to GPU 0 that occurs when a string like
+            # "cuda:1" is passed to `device_map`.
+            return {"": self.prefer_gpu}
         else:
             return "auto"
 
