@@ -3,7 +3,7 @@
   "device": "cuda:0",
   "critic_device": "cuda:0",
   "training": {
-    "lr": 5e-3,
+    "lr": 0.005,
     "value_lr": 0.005,
     "gamma": 0.99,
     "gae_lambda": 0.95,
@@ -16,10 +16,8 @@
     "rollout_steps": 96,
     "save_freq": 25,
     "debug_mode": false,
-    "ce_coef": 0.2,
+    "entropy_coef": 0.01,
     "kl_coef": 0.5,
-    "adv_coef": 0.1,
-    "sem_coef": 0.1,
     "perplexity_coef": 0.1,
     "seed": null,
     "alg": "ppo",
@@ -61,15 +59,15 @@
     "dynamic_batch_sizing": true,
     "max_memory_per_gpu": 0.9,
     "chunked_forward_pass": true,
-    "chunk_size": 56,
+    "chunk_size": 48,
     "use_first_layer_attention_only": true,
     "critic_chunking_threshold": 100,
-    "critic_max_chunk_size": 56,
+    "critic_max_chunk_size": 48,
     "critic_memory_fraction": 0.8,
     "use_task_reward": true,
     "use_per_token_advantages": true,
     "actor_chunking_enabled": true,
-    "actor_max_chunk_size": 56,
+    "actor_max_chunk_size": 48,
     "actor_memory_fraction": 0.7,
     "max_marginal_token_positions": 8
   },
@@ -85,10 +83,12 @@
     "lora_r": 4,
     "lora_alpha": 2,
     "lora_dropout": 0.05,
-    "target_modules": ["q_proj", "k_proj"],
-    "target_layers": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+    "target_modules": [
+      "q_proj",
+      "k_proj"
+    ],
+    "target_layers": [10,11,12,13,14,15,16,17,18,19,20],
     "target_model": null,
-    "detune": false,
     "value_loss_coef": 0.5,
     "sequence_value_coef": 0.5,
     "token_value_coef": 0.5,
@@ -118,8 +118,6 @@
     "batch_size": 48,
     "target_model": "meta-llama/Llama-3.1-8B-Instruct",
     "guard_model": "meta-llama/Llama-Guard-3-8B",
-    "use_custom_reward": false,
-    "reward_model_path": null,
     "warmup_max_new_tokens": 20,
     "target_quantize": false,
     "guard_quantize": false,
@@ -128,4 +126,4 @@
     "target_max_cpu_memory": null,
     "guard_max_cpu_memory": null
   }
-} 
+}

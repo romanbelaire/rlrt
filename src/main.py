@@ -39,10 +39,8 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train or evaluate a red teaming agent.")
     
-    # Mode selection arguments
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--train", action="store_true", help="Train the agent")
-    mode_group.add_argument("--test", action="store_true", help="Test the agent")
+    # Note: Training and testing are now handled by separate modules
+    # Use test_runner.py for evaluation: python -m src.test_runner --config-path config.json --checkpoint-dir path/to/checkpoint
     
     # Configuration arguments
     parser.add_argument("--config_path", type=str, help="Path to JSON configuration file")
@@ -1132,7 +1130,7 @@ def train_agent(config: AgentConfig):
         high_level_optimizer=high_level_optimizer,
         clip_ratio=config.training.clip,
         value_loss_coef=config.model.value_loss_coef,
-        entropy_coef=config.training.ce_coef,
+        entropy_coef=config.training.entropy_coef,
         kl_coef=config.training.kl_coef,
         perplexity_coef=config.training.perplexity_coef,
         max_grad_norm=config.training.max_grad_norm,
@@ -1497,33 +1495,7 @@ def save_checkpoint(
     print(f"Checkpoint saved to {checkpoint_dir}")
 
 
-def test_agent(config: AgentConfig):
-    """
-    Test an agent using the provided configuration.
-    
-    Args:
-        config: Agent configuration
-    """
-    print(f"Testing agent with configuration:")
-    print(f"  - Model: {config.model.hf_checkpoint}")
-    print(f"  - Data path: {config.environment.data_path}")
-    print(f"  - Target model: {config.environment.target_model}")
-    
-    # Initialize model singletons
-    singletons = setup_model_singletons(config)
-    
-    # Build environment
-    env = build_environment(config, singletons["tokenizer"], singletons)
-    
-    # Build policy
-    policy = build_policy(config, singletons, env)
-    
-    # Here you would initialize and test the complete agent
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Agent components initialized. Ready for testing.")
-    
-    # This is just a placeholder - the actual testing would use the full Agent class
-    # that will be implemented in a separate file.
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Testing implementation to be completed in future steps.")
+
 
 
 def save_configuration(config: AgentConfig, output_dir: str) -> None:
@@ -1555,12 +1527,9 @@ def main():
     # Save the configuration
     save_configuration(config, config.training.output_dir)
     
-    # Run in the appropriate mode
+    # Run training (testing is now handled by test_runner.py)
     try:
-        if args.train:
-            train_agent(config)
-        elif args.test:
-            test_agent(config)
+        train_agent(config)
     except Exception as e:
         print(f"An error occurred: {e}")
         traceback.print_exc()

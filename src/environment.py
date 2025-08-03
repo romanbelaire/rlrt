@@ -555,8 +555,7 @@ class MultiStepEnv(Environment):
                  batch_size: Optional[int] = None, 
                  harm_threshold: Optional[float] = None, 
                  target_model_name: Optional[str] = None,
-                 use_custom_reward: Optional[bool] = None,
-                 reward_model_path: Optional[str] = None,
+
                  seed: Optional[int] = None,
                  target_singleton: Optional[Any] = None,
                  target_tokenizer: Optional[Any] = None,
@@ -579,8 +578,7 @@ class MultiStepEnv(Environment):
             batch_size: Batch size for data loading
             harm_threshold: Threshold for harm detection
             target_model_name: Name of the target model
-            use_custom_reward: Whether to use a custom reward model
-            reward_model_path: Path to the custom reward model
+            
             seed: Random seed for reproducibility
             target_singleton: Singleton instance for target model (if provided)
             target_tokenizer: Tokenizer for target model (if provided)
@@ -608,8 +606,7 @@ class MultiStepEnv(Environment):
             self.batch_size = batch_size if batch_size is not None else config.batch_size
             self.harm_threshold = harm_threshold if harm_threshold is not None else config.harm_threshold
             self.target_model_name = target_model_name if target_model_name is not None else config.target_model
-            self.use_custom_reward = use_custom_reward if use_custom_reward is not None else config.use_custom_reward
-            self.reward_model_path = reward_model_path if reward_model_path is not None else config.reward_model_path
+            
 
             # Guard model name (falls back to default if missing)
             self.guard_model_name = config.guard_model if getattr(config, 'guard_model', None) is not None else "meta-llama/Llama-Guard-3-8B"
@@ -642,8 +639,7 @@ class MultiStepEnv(Environment):
             self.harm_threshold = harm_threshold if harm_threshold is not None else 1.5
             self.target_model_name = target_model_name
             self.guard_model_name = "meta-llama/Llama-Guard-3-8B"
-            self.use_custom_reward = use_custom_reward if use_custom_reward is not None else False
-            self.reward_model_path = reward_model_path
+
             self.debug_mode = debug_mode
             self.max_new_tokens = max_new_tokens if max_new_tokens is not None else (1 if self.debug_mode else 100)
 
@@ -796,9 +792,7 @@ class MultiStepEnv(Environment):
             np.random.seed(seed)
             torch.manual_seed(seed)
         
-        # Initialize custom reward model if specified
-        if self.use_custom_reward and self.reward_model_path:
-            self._load_custom_reward_model(self.reward_model_path)
+
         
         # Initialize state
         self.state = None
@@ -1589,9 +1583,7 @@ class MultiStepEnv(Environment):
         Returns:
             Safety scores
         """
-        # Use custom reward model if available
-        if self.use_custom_reward and hasattr(self, 'reward_model'):
-            return self._score_safety_custom(responses, questions, reference_state)
+
             
         # Use guard model with optimized minibatching
         if hasattr(self, 'guard_model') and self.guard_model is not None:
@@ -1722,53 +1714,7 @@ class MultiStepEnv(Environment):
         print("No guard model available, returning neutral scores")
         return torch.ones(len(responses)) * 0.5
     
-    def _score_safety_custom(self, 
-                            responses: List[str], 
-                            questions: Optional[List[str]] = None,
-                            reference_state: Optional[List[str]] = None) -> torch.Tensor:
-        """
-        Score safety using a custom reward model.
-        
-        Args:
-            responses: Responses to evaluate
-            questions: Questions that prompted the responses
-            reference_state: Original state for reference
-            
-        Returns:
-            Safety scores
-        """
-        max_len = 512
-        reward_model_device = next(self.reward_model.parameters()).device
-        
-        # Tokenize inputs
-        batch_encoding = self.reward_tokenizer(
-            responses,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_len
-        ).to(reward_model_device)
-        
-        # Get predictions
-        with torch.no_grad():
-            model_output = self.reward_model(
-                input_ids=batch_encoding.input_ids,
-                attention_mask=batch_encoding.attention_mask
-            )
-            
-            # Process output based on expected format
-            if isinstance(model_output, torch.Tensor):
-                if model_output.dim() == 2:  # [batch, seq_len]
-                    scores = model_output.sum(dim=1)
-                elif model_output.dim() == 1:  # [batch]
-                    scores = model_output
-                else:
-                    scores = model_output.view(model_output.shape[0], -1).sum(dim=1)
-                    
-            else:  # Handle dictionary or other output types
-                scores = model_output.logits.view(model_output.logits.shape[0], -1).mean(dim=1)
-                
-        return scores
+
     
     def _get_embed_similarity_batched(self, 
                                       sequences1: List[str], 
@@ -1869,36 +1815,7 @@ class MultiStepEnv(Environment):
         
         return refusal_scores
     
-    def _load_custom_reward_model(self, model_path: str) -> bool:
-        """
-        Load a custom reward model.
-        
-        Args:
-            model_path: Path to the reward model
-            
-        Returns:
-            Success flag
-        """
-        # Load tokenizer
-        self.reward_tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
-        
-        # Set pad token to eos token if not set
-        if self.reward_tokenizer.pad_token is None:
-            if self.reward_tokenizer.eos_token is not None:
-                self.reward_tokenizer.pad_token = self.reward_tokenizer.eos_token
-                self.reward_tokenizer.pad_token_id = self.reward_tokenizer.eos_token_id
-            else:
-                # Fallback if no eos token
-                self.reward_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        
-        # Load model
-        self.reward_model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map="auto"
-        )
-        
-        print(f"Successfully loaded custom reward model from {model_path}")
-        return True
+
 
     def get_target_responses(self, actions: Union[List[str], str], include_conversation_history: bool = False) -> List[str]:
         """

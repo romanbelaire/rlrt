@@ -32,10 +32,8 @@ class TrainingConfig:
     save_freq: int = 50
     
     # Loss coefficients
-    ce_coef: float = 0.5
+    entropy_coef: float = 0.01
     kl_coef: float = 0.01
-    adv_coef: float = 0.1
-    sem_coef: float = 0.1
     perplexity_coef: float = 0.1
     
     # Randomization
@@ -180,7 +178,6 @@ class ModelConfig:
     
     # Target model settings
     target_model: Optional[str] = None
-    detune: bool = False
     
     # Critic settings
     value_loss_coef: float = 0.5
@@ -287,8 +284,6 @@ class EnvironmentConfig:
     guard_quantize: Union[bool, int] = False
     
     # Reward configuration
-    use_custom_reward: bool = False
-    reward_model_path: Optional[str] = None
     
     # White-box reward components
     similarity_weight: float = 0.1  # Weight for embedding similarity in reward calculation
@@ -399,15 +394,7 @@ class AgentConfig:
             env_dict = {k: v for k, v in config_dict.items() 
                        if k in [f.name for f in fields(EnvironmentConfig)]}
         
-        # Handle backward compatibility: map dataset_path to data_path if it exists
-        if "dataset_path" in env_dict and "data_path" not in env_dict:
-            env_dict["data_path"] = env_dict["dataset_path"]
-            print(f"Warning: 'dataset_path' is deprecated, using value for 'data_path': {env_dict['data_path']}")
-        
-        # Handle backward compatibility: map guard_model_path to guard_model if it exists
-        if "guard_model_path" in env_dict and "guard_model" not in env_dict:
-            env_dict["guard_model"] = env_dict["guard_model_path"]
-            print(f"Warning: 'guard_model_path' is deprecated, using value for 'guard_model': {env_dict['guard_model']}")
+
         
         # Create component configs with explicit error handling
         try:

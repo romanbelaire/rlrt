@@ -20,8 +20,19 @@ import uuid
 # agent models reuse them exactly like the environment models.  This must be
 # set *before* any call to deepspeed.init_inference() or Triton compilation.
 # ---------------------------------------------------------------------------
-os.environ.setdefault("TRITON_CACHE_DIR", "/common/scratch/users/r/rbelaire.2021/triton_cache")
-os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/common/scratch/users/r/rbelaire.2021/torch_extensions")
+
+import getpass
+
+def get_user_path():
+    """Get the full user path including first initial directory."""
+    user_id = getpass.getuser()
+    first_initial = user_id[0].lower()  # Get first letter of username
+    return f"{first_initial}/{user_id}"
+
+# Set cache directories with automatically inferred user path
+user_path = get_user_path()
+os.environ.setdefault("TRITON_CACHE_DIR", f"/common/scratch/users/{user_path}/triton_cache")
+os.environ.setdefault("TORCH_EXTENSIONS_DIR", f"/common/scratch/users/{user_path}/torch_extensions")
 
 class ModelBase(nn.Module):
     """
