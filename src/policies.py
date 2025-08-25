@@ -905,7 +905,7 @@ class LowLevelPolicy(AbstractPolicy):
         # Only enable gradients for the last token to save memory during training
         with torch.set_grad_enabled(require_grad):
             # Debug: Ensure inputs are on the correct device
-            # For 4-bit quantized models, get device from the input embeddings layer
+            # For sharded/quantized models, get device from the input embeddings layer
             model_device = self.model.get_input_embeddings().weight.device
             if inputs.device != model_device:
                 print(f"Moving inputs from {inputs.device} to {model_device}")
@@ -953,6 +953,9 @@ class LowLevelPolicy(AbstractPolicy):
             entropy = -(probs * F.log_softmax(logits_clamped, dim=-1)).sum(dim=-1)
             H = -entropy.mean()
             policy_entropy.append(H)
+            
+            # MEMORY CLEANUP: Delete intermediate tensors
+            del probs, entropy
         
         # Calculate overall entropy
         policy_entropy = torch.stack(policy_entropy).mean()
@@ -984,7 +987,7 @@ class LowLevelPolicy(AbstractPolicy):
         Returns:
             torch.Tensor: Similarity scores
         """
-        device = next(self.model.parameters()).device
+        device = self.model.get_input_embeddings().weight.device
         
         # Process sequences1
         if isinstance(sequences1, torch.Tensor):
@@ -1584,19 +1587,76 @@ class TemplatePolicy(LowLevelPolicy):
             # Collect all formatted responses for this state
             state_formatted_responses = []
             
+            # Parse base_state into question/context and choices for formatting
+            if isinstance(base_state_i, str):
+                parsed = self._parse_mc_base_state(base_state_i)
+            else:
+                parsed = {"question": "", "context": "", "choices": [], "choices_text": ""}
+            
             # Apply each template
             for j, template_data in enumerate(self.templates):
-                template = template_data['template']
+                template = template_data.get('template')
+                if not template:
+                    # If no template string provided, fall back to instruction or base action
+                    template = template_data.get('instruction') or "{question}"
                 
-                # Format the template
-                if 'topic' in template and 'question' in template:
-                    formatted_response = template.format(question=base_action_i, topic=topic_i)
-                elif 'question' in template:
-                    formatted_response = template.format(question=base_action_i)
-                else:
-                    formatted_response = base_action_i
+                # Infer option label from id if present (e.g., mc_examine_A)
+                tpl_id = template_data.get('id', '')
+                option_label = None
+                if tpl_id.endswith('_A'):
+                    option_label = 'A'
+                elif tpl_id.endswith('_B'):
+                    option_label = 'B'
+                elif tpl_id.endswith('_C'):
+                    option_label = 'C'
+                elif tpl_id.endswith('_D'):
+                    option_label = 'D'
                 
-                # Check if the formatted response is a refusal and skip if so
+                option_text = ""
+                if option_label is not None and parsed["choices"]:
+                    idx = ord(option_label) - ord('A')
+                    if 0 <= idx < len(parsed["choices"]):
+                        option_text = parsed["choices"][idx]
+                
+                # Build history and last-thought context
+                last_thought = ""
+                history_text = ""
+                if isinstance(state_i, list):
+                    # state_i is like [formatted_question, *history]
+                    history = [s for s in state_i[1:] if isinstance(s, str)]
+                    if history:
+                        last_thought = history[-1]
+                        history_text = "\n".join(history)
+                elif isinstance(state_i, str):
+                    # Heuristic: take lines after the first blank line as history
+                    parts = [ln for ln in state_i.splitlines() if ln.strip()]
+                    if len(parts) > 2:
+                        last_thought = parts[-1]
+                        history_text = "\n".join(parts[1:])
+                
+                # Build formatting dict
+                fmt = {
+                    "question": parsed["question"],
+                    "context": parsed["question"] or parsed["context"],
+                    "choices_text": parsed["choices_text"],
+                    "option_label": option_label or "",
+                    "option_text": option_text,
+                    "last_thought": last_thought,
+                    "history": history_text,
+                }
+                
+                # Ensure last thinking step is included even if template lacks an explicit placeholder
+                template_for_format = template
+                if "{last_thought}" not in template_for_format and last_thought:
+                    template_for_format = template_for_format + "\n\nPrior reasoning: {last_thought}"
+                
+                try:
+                    formatted_response = template_for_format.format(**fmt)
+                except Exception:
+                    # Fail loudly but fallback to instruction if formatting keys mismatch
+                    formatted_response = template_for_format
+                
+                # Check refusal
                 if self._detect_refusal(formatted_response):
                     if self.debug_mode:
                         print(f"Skipping template due to refusal pattern: {template_data.get('id', 'unknown')}")
@@ -1607,14 +1667,14 @@ class TemplatePolicy(LowLevelPolicy):
                 all_state_indices.append(i)
                 all_template_indices.append(j)
             
-            # If all templates were filtered out due to refusals, use the base action
+            # If all templates were filtered, fallback
             if not state_formatted_responses:
                 if self.debug_mode:
-                    print("All templates contained refusals, falling back to base action")
+                    print("All templates contained refusals or failed formatting, falling back to base action")
                 state_formatted_responses = [base_action_i]
                 all_formatted_responses.append(base_action_i)
                 all_state_indices.append(i)
-                all_template_indices.append(-1)  # Special index for base action
+                all_template_indices.append(-1)
             
             batch_formatted_responses.append(state_formatted_responses)
         
@@ -1857,7 +1917,19 @@ class TemplatePolicy(LowLevelPolicy):
                     step_templates.append(templates_i)
                 
                 # Step the environment with the best actions
-                next_state, actual_responses, actual_rewards, done = env.step(best_actions)
+                step_template_ids = []
+                step_system_prompts = []
+                for i in range(len(state)):
+                    if already_dones[i]:
+                        step_template_ids.append("")
+                        step_system_prompts.append("")
+                        continue
+                    chosen_idx = best_action_idx[i] if i < len(best_action_idx) else 0
+                    template_id = self.templates[chosen_idx]['id'] if chosen_idx < len(self.templates) else ""
+                    step_template_ids.append(template_id)
+                    # Pass the instruction for judge shaping; fall back to empty string
+                    step_system_prompts.append(self.templates[chosen_idx].get('instruction', ""))
+                next_state, actual_responses, actual_rewards, done = env.step(best_actions, template_ids=step_template_ids, system_prompt=step_system_prompts)
                 
                 # Store data for all template branches
                 for i in range(len(next_state)):
@@ -1996,3 +2068,21 @@ class TemplatePolicy(LowLevelPolicy):
             'batch_base_state': batch_base_states,
             'branch_metadata': branch_metadata  # Add branch metadata for GAE
         }
+
+    def _parse_mc_base_state(self, base_text: str) -> Dict[str, Any]:
+        """
+        Parse the environment base state (formatted question + choices) into structured pieces
+        that templates can format with. Returns keys: question/context, choices, choices_text.
+        """
+        lines = [ln for ln in (base_text or "").splitlines() if ln.strip()]
+        question = ""
+        context = ""
+        choices: List[str] = []
+        for ln in lines:
+            if ln.startswith("Question:"):
+                question = ln[len("Question:"):].strip()
+            elif ") " in ln and ln[0].isalpha() and ln[1] == ')':
+                # e.g., "A) text"
+                choices.append(ln.split(") ", 1)[1].strip())
+        choices_text = "\n".join([f"{chr(ord('A')+i)}) {c}" for i, c in enumerate(choices)])
+        return {"question": question, "context": context, "choices": choices, "choices_text": choices_text}

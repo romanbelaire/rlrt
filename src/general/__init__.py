@@ -1,0 +1,1 @@
+# Namespace for general (non-adversarial) environment support and adapters. 

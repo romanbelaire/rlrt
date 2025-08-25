@@ -42,7 +42,7 @@ class LLMHighLevelPolicy(nn.Module):
         self.temperature = temperature
         self.top_p = top_p
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        # Avoid forcing a device move for potentially sharded models; rely on input placement
 
         # For compatibility with template-based policies
         self.num_actions = 0
@@ -56,7 +56,10 @@ class LLMHighLevelPolicy(nn.Module):
             return_tensors="pt",
             padding=True,
             truncation=True,
-        ).to(self.device)
+        )
+        # Route to the device of the model's input embeddings (first shard)
+        model_device = self.model.get_input_embeddings().weight.device
+        enc = {k: v.to(model_device) for k, v in enc.items()}
 
         outputs = self.model.generate(
             **enc,

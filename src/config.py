@@ -85,7 +85,7 @@ class TrainingConfig:
 
     # Warmup strategy for optimizer initialization
     warmup_batch_size: int = 8  # Small batch size for quick optimizer initialization
-    use_warmup: bool = True     # Whether to use warmup strategy
+    use_warmup: bool = False     # Whether to use warmup strategy
 
     # NEW: Warmup rollout steps (allows shorter rollouts during warmup)
     warmup_rollout_steps: int = 8
@@ -94,7 +94,7 @@ class TrainingConfig:
     # Number of top-K tokens (based on attention) to consider when computing marginal rewards
     num_masked_marginal_tokens: int = 3
     # Whether to additionally compute pairwise marginal masking among the selected top-K tokens
-    pairwise_marginal_masking: bool = False
+    pairwise_marginal_masking: bool = True
     # NEW: If True, choose the second token in pairwise masking uniformly at random instead of exhaustively enumerating all pairs.
     uniform_pairwise_selection: bool = False
     # NEW: Number of random secondary tokens to sample per primary token when uniform_pairwise_selection is enabled.
@@ -115,8 +115,11 @@ class TrainingConfig:
     chunk_size: int = 4
     use_first_layer_attention_only: bool = True
     
+    # Actor/critic chunking controls
+    actor_chunk_threshold: int = 2048
+    
     # Model swapping for DeepSpeed compatibility
-    enable_model_swapping: bool = True
+    enable_model_swapping: bool = False
 
     # Critic training chunking settings
     critic_chunking_threshold: int = 100  # Sequence length threshold for chunking
@@ -140,6 +143,14 @@ class TrainingConfig:
     # Whether to use naïve back-to-front γ-decayed per-token rewards instead of marginal masking
     naive_decayed_token_reward: bool = False
 
+    # HL-only training mode: if True, only train high-level policy and critics (freeze LL agent)
+    hl_only_training: bool = False
+    
+    # Skywork reward model configuration for token-level critic training
+    use_skywork_for_token_critic: bool = True  # Whether to use Skywork reward model for token-level critic
+    skywork_model_name: str = "Skywork/Skywork-Reward-V2-Llama-3.1-8B"  # Skywork model to use
+    skywork_eval_batch_size: int = 4  # Batch size for Skywork reward evaluation (conservative)
+
 
 @dataclass
 class ModelConfig:
@@ -162,11 +173,13 @@ class ModelConfig:
 
     
     # High-level policy configuration
-    use_high_level_policy: bool = False
+    use_high_level_policy: bool = True
     high_level_lr: float = 0.001
     
     # Memory management
     keep_base_on_cpu: bool = False
+    # Enable sharded placement via Transformers/Accelerate device_map
+    enable_device_map: bool = False
     
     # LoRA configuration
     use_lora: bool = False
@@ -296,6 +309,45 @@ class EnvironmentConfig:
     target_max_cpu_memory: Optional[str] = None
     guard_max_cpu_memory: Optional[str] = None
 
+    # Enable usage of LMRL-Gym general environments instead of adversarial MultiStepEnv
+    use_lmrl: bool = False
+    # Task identifier within LMRL-Gym (e.g., "maze", "wordle", "chess", "text_nav")
+    lmrl_task: Optional[str] = None
+    # Free-form options passed to the task factory (e.g., {"maze_name": "umaze", "max_steps": 50})
+    lmrl_options: Dict[str, Any] = field(default_factory=dict)
+
+    # New: environment task selector for general envs (e.g., "mc_multiturn")
+    env_task: Optional[str] = None
+
+
+@dataclass
+class SemanticAnalysisConfig:
+    """Configuration for semantic analysis data collection."""
+    
+    # Collection settings
+    max_conversation_length: int = 30
+    batch_size: int = 4
+    save_interval: int = 100  # Save every N conversations
+    
+    # Vector storage settings
+    faiss_index_type: str = "IndexFlatIP"
+    embedding_dim: int = 4096  # Will be inferred from model
+    
+    # Output settings
+    output_dir: str = "semantic_analysis_output"
+    vector_store_path: str = "semantic_vectors"
+    metadata_path: str = "conversation_metadata.json"
+    
+    # Model settings
+    target_model: str = "meta-llama/Llama-3.2-1B-Instruct"
+    guard_model: str = "meta-llama/Llama-Guard-3-8B"
+    use_quantization: bool = True
+    
+    # HarmBench data settings
+    harmbench_path: str = "HarmBench/harmbench_behaviors_text_all.csv"
+    category_column: str = "SemanticCategory"
+    question_column: str = "Behavior"
+
 
 @dataclass
 class AgentConfig:
@@ -305,6 +357,7 @@ class AgentConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    semantic_analysis: Optional[SemanticAnalysisConfig] = None
     
     # Flag for overriding saved config
     override: bool = False
@@ -362,11 +415,14 @@ class AgentConfig:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
-        return {
+        config_dict = {
             "training": asdict(self.training),
             "model": asdict(self.model),
             "environment": asdict(self.environment)
         }
+        if self.semantic_analysis is not None:
+            config_dict["semantic_analysis"] = asdict(self.semantic_analysis)
+        return config_dict
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'AgentConfig':
@@ -385,6 +441,7 @@ class AgentConfig:
             training_dict = config_dict.get("training", {})
             model_dict = config_dict.get("model", {})
             env_dict = config_dict.get("environment", {})
+            semantic_dict = config_dict.get("semantic_analysis", {})
         else:
             # Flat format - extract component configs from top level
             training_dict = {k: v for k, v in config_dict.items() 
@@ -393,8 +450,56 @@ class AgentConfig:
                          if k in [f.name for f in fields(ModelConfig)]}
             env_dict = {k: v for k, v in config_dict.items() 
                        if k in [f.name for f in fields(EnvironmentConfig)]}
+            semantic_dict = {k: v for k, v in config_dict.items() 
+                           if k in [f.name for f in fields(SemanticAnalysisConfig)]}
         
 
+        
+        # Handle legacy field name mappings for backward compatibility
+        training_field_mappings = {
+            'ce_coef': 'entropy_coef',  # Old name -> new name
+            'adv_coef': None,  # Removed field
+            'sem_coef': None,  # Removed field
+        }
+        
+        model_field_mappings = {
+            'detune': None,  # Removed field
+        }
+        
+        env_field_mappings = {
+            'use_custom_reward': None,  # Removed field
+            'reward_model_path': None,  # Removed field
+        }
+        
+        # Apply training field mappings
+        for old_name, new_name in training_field_mappings.items():
+            if old_name in training_dict:
+                if new_name is not None:
+                    training_dict[new_name] = training_dict.pop(old_name)
+                    print(f"Warning: Mapped deprecated training field '{old_name}' to '{new_name}'")
+                else:
+                    training_dict.pop(old_name)
+                    print(f"Warning: Removed deprecated training field '{old_name}'")
+        
+        # Apply model field mappings
+        for old_name, new_name in model_field_mappings.items():
+            if old_name in model_dict:
+                if new_name is not None:
+                    model_dict[new_name] = model_dict.pop(old_name)
+                    print(f"Warning: Mapped deprecated model field '{old_name}' to '{new_name}'")
+                else:
+                    model_dict.pop(old_name)
+                    print(f"Warning: Removed deprecated model field '{old_name}'")
+        
+        # Apply environment field mappings
+        for old_name, new_name in env_field_mappings.items():
+            if old_name in env_dict:
+                if new_name is not None:
+                    env_dict[new_name] = env_dict.pop(old_name)
+                    print(f"Warning: Mapped deprecated environment field '{old_name}' to '{new_name}'")
+                else:
+                    env_dict.pop(old_name)
+                    print(f"Warning: Removed deprecated environment field '{old_name}'")
         
         # Create component configs with explicit error handling
         try:
@@ -418,6 +523,16 @@ class AgentConfig:
             invalid_fields = [k for k in env_dict.keys() if k not in valid_fields]
             raise ValueError(f"Invalid environment configuration fields: {invalid_fields}. Valid fields are: {valid_fields}") from e
         
+        # Create semantic analysis config if provided
+        semantic_config = None
+        if semantic_dict:
+            try:
+                semantic_config = SemanticAnalysisConfig(**semantic_dict)
+            except TypeError as e:
+                valid_fields = [f.name for f in fields(SemanticAnalysisConfig)]
+                invalid_fields = [k for k in semantic_dict.keys() if k not in valid_fields]
+                raise ValueError(f"Invalid semantic analysis configuration fields: {invalid_fields}. Valid fields are: {valid_fields}") from e
+        
         # Get override flag
         override = config_dict.get('override', False)
         
@@ -426,6 +541,7 @@ class AgentConfig:
             training=training_config,
             model=model_config,
             environment=env_config,
+            semantic_analysis=semantic_config,
             override=override
         )
     

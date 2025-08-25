@@ -249,7 +249,7 @@ def _load_policy_with_singleton(policy_dir: str, agent_singleton, device: str = 
     return policy
 
 
-def _load_high_level_policy(high_level_policy_dir: str, device: str = "cuda" if torch.cuda.is_available() else "cpu", encoder: Optional[Any] = None):
+def _load_high_level_policy(high_level_policy_dir: str, device: str = "cuda" if torch.cuda.is_available() else "cpu", encoder: Optional[Any] = None, tokenizer: Optional[Any] = None):
     """Load high-level policy if it exists."""
     if not os.path.exists(high_level_policy_dir):
         return None
@@ -268,9 +268,10 @@ def _load_high_level_policy(high_level_policy_dir: str, device: str = "cuda" if 
             return TemplateHighLevelPolicy.load(high_level_policy_dir, device=device)
         elif policy_type == "ppo":
             if encoder is None:
-                print("[TEST-RUNNER] WARNING: Encoder not provided for PPO high-level policy, cannot load")
-                return None
-            return PPOTemplateHighLevelPolicy.load(high_level_policy_dir, device=device, encoder=encoder, tokenizer=None)
+                raise ValueError("Encoder not provided for PPO high-level policy, cannot load")
+            if tokenizer is None:
+                raise ValueError("Tokenizer not provided for PPO high-level policy, cannot load")
+            return PPOTemplateHighLevelPolicy.load(high_level_policy_dir, device=device, encoder=encoder, tokenizer=tokenizer)
         elif policy_type == "llm":
             return LLMHighLevelPolicy.load(high_level_policy_dir, device=device)
         elif policy_type == "hybrid":
@@ -280,8 +281,8 @@ def _load_high_level_policy(high_level_policy_dir: str, device: str = "cuda" if 
             return None
             
     except Exception as e:
-        print(f"[TEST-RUNNER] WARNING: Failed to load high-level policy: {e}")
-        return None
+        # Let the actual error propagate through
+        raise
 
 
 def extract_topic_from_state(state: List[str]) -> str:
@@ -405,7 +406,7 @@ def _evaluate_batch(
                         return_tensors="pt", 
                         truncation=True,
                         max_length=512
-                    ).input_ids.to(high_level_policy.device)
+                    ).input_ids
 
                     # Get strategy selection
                     strategy_logits = high_level_policy.forward(state_tokens)
@@ -734,6 +735,7 @@ def evaluate_agent(config_path: str, checkpoint_dir: str, eval_batch_size: int =
     agent_singleton = None
 
     # Tokenizer
+    print(f"[TEST-RUNNER] Loading tokenizer from: {config.model.hf_checkpoint}")
     tokenizer = AutoTokenizer.from_pretrained(
         config.model.hf_checkpoint,
         use_fast=True,
@@ -904,7 +906,8 @@ def evaluate_agent(config_path: str, checkpoint_dir: str, eval_batch_size: int =
     # Load high-level policy if it exists
     # Get encoder from the policy's base model for high-level policy loading
     encoder = policy.base_model if hasattr(policy, 'base_model') else None
-    high_level_policy = _load_high_level_policy(high_level_policy_dir, device=device, encoder=encoder)
+    # Pass tokenizer from model_singletons to the high-level policy loading
+    high_level_policy = _load_high_level_policy(high_level_policy_dir, device=device, encoder=encoder, tokenizer=model_singletons["tokenizer"])
     
     if high_level_policy is not None:
         # Ensure high-level policy has proper tokenizer and device setup

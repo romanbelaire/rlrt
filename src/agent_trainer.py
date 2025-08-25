@@ -174,6 +174,9 @@ def collect_rollout(
     templates = load_templates(templates_path)
     # Build registry once (fail-fast if empty)
     registry = TemplateRegistry(templates_path)
+    # Enforce presence of a high-level policy (central component)
+    if high_level_policy is None:
+        raise ValueError("High-level policy is required. Provide a templates-driven policy to produce instructions.")
     
     # Reset environment
     state = environment.reset()
@@ -258,11 +261,15 @@ def collect_rollout(
                             state_text = str(state_item)
 
                         enc = tokenizer(state_text, return_tensors="pt", truncation=True)
-                        strategy_idx = high_level_policy.select_action(
-                            enc.input_ids.to(high_level_policy.device), enc.attention_mask.to(high_level_policy.device)
-                        )
-
-                        # Get the abstract instruction for this strategy
+                        # High-level epsilon exploration schedule (anneals like low-level)
+                        hl_epsilon_start = getattr(config.training, 'hl_epsilon_start', 0.8)
+                        hl_epsilon_end = getattr(config.training, 'hl_epsilon_end', 0.0)
+                        hl_epsilon_decay_episodes = getattr(config.training, 'hl_epsilon_decay_episodes', 100)
+                        hl_epsilon = hl_epsilon_end + (hl_epsilon_start - hl_epsilon_end) * max(0, (hl_epsilon_decay_episodes - episode) / hl_epsilon_decay_episodes)
+                        if random.random() < hl_epsilon:
+                            strategy_idx = random.randint(0, len(high_level_policy.strategies) - 1)
+                        else:
+                            strategy_idx = high_level_policy.select_action(enc.input_ids, enc.attention_mask)
                         strategy = high_level_policy.strategies[strategy_idx]
                         instruction = strategy["instruction"]
                         
@@ -306,23 +313,26 @@ def collect_rollout(
                         else:
                             state_text = str(state_item)
 
-                        # Tokenize state for high-level policy
                         enc = tokenizer(state_text, return_tensors="pt", truncation=True)
-                        state_tokens = enc.input_ids.to(high_level_policy.device)
-
-                        # Get strategy selection and log probabilities
+                        state_tokens = enc.input_ids
                         strategy_logits = high_level_policy.forward(state_tokens)
-                        # Clamp logits to prevent overflow in softmax for 4-bit quantization
                         strategy_logits_clamped = torch.clamp(strategy_logits, min=-5, max=5)
                         probs = F.softmax(strategy_logits_clamped, dim=-1)
                         strategy_log_probs = F.log_softmax(strategy_logits_clamped, dim=-1)
-                        
-                        # Sample strategy
-                        strategy_idx = torch.multinomial(probs, 1).squeeze(-1)
-                        selected_log_prob = strategy_log_probs.gather(1, strategy_idx.unsqueeze(-1)).squeeze(-1)
-
-                        # Get the abstract instruction for this strategy
-                        strategy = high_level_policy.strategies[strategy_idx.item()]
+                        # High-level epsilon exploration schedule (anneals like low-level)
+                        hl_epsilon_start = getattr(config.training, 'hl_epsilon_start', 0.8)
+                        hl_epsilon_end = getattr(config.training, 'hl_epsilon_end', 0.0)
+                        hl_epsilon_decay_episodes = getattr(config.training, 'hl_epsilon_decay_episodes', 100)
+                        hl_epsilon = hl_epsilon_end + (hl_epsilon_start - hl_epsilon_end) * max(0, (hl_epsilon_decay_episodes - episode) / hl_epsilon_decay_episodes)
+                        if random.random() < hl_epsilon:
+                            strategy_idx = random.randint(0, len(high_level_policy.strategies) - 1)
+                            selected_log_prob = float('nan')
+                        else:
+                            strategy_idx = torch.multinomial(probs, 1).squeeze(-1)
+                            selected_log_prob = strategy_log_probs.gather(1, strategy_idx.unsqueeze(-1)).squeeze(-1)
+                        if isinstance(strategy_idx, torch.Tensor):
+                            strategy_idx = strategy_idx.item()
+                        strategy = high_level_policy.strategies[strategy_idx]
                         instruction = strategy["instruction"]
                         
                         # Extract template ID for tracking
@@ -344,10 +354,10 @@ def collect_rollout(
                             instruction, topic, question, conversation
                         )
 
-                        chosen_strategy_indices[idx] = strategy_idx.item()
+                        chosen_strategy_indices[idx] = strategy_idx
                         chosen_state_texts[idx] = state_text
                         high_level_instructions[idx] = formatted_instruction
-                        current_high_level_log_probs[idx] = selected_log_prob.item()
+                        current_high_level_log_probs[idx] = selected_log_prob
                 elif policy_kind == "llm":
                     # LLM-based high-level policy: generate instructions freehand
                     # Prepare plain text states for the whole batch
@@ -389,14 +399,29 @@ def collect_rollout(
                 else:
                     raise ValueError(f"Unsupported high_level_policy.policy_kind: {policy_kind}")
             else:
-                chosen_strategy_indices = None
-                chosen_state_texts = None
-                # If a fixed high-level instruction is specified in the config, propagate it so
-                # the low-level policy still receives guidance even without an explicit
-                # high-level module.
-                fixed_instr = getattr(config.model, "fixed_high_level_instruction", None)
-                high_level_instructions = [fixed_instr] * batch_size if fixed_instr is not None else None
-                current_high_level_log_probs = None
+                # High-level policy must be provided; fail fast if absent
+                raise ValueError("high_level_policy is None. High-level instructions are required and must come from the templates-driven policy.")
+
+            # Debug: print integer list of HL actions for this step (None -> -1)
+            try:
+                hl_actions = [(-1 if (chosen_strategy_indices is None or chosen_strategy_indices[i] is None) else int(chosen_strategy_indices[i])) for i in range(batch_size)]
+                print("hl_actions", hl_actions)
+            except Exception:
+                # Fail loud if shapes are inconsistent in debug mode only
+                if getattr(config.training, 'debug_mode', False):
+                    raise
+
+            # Strictly validate high_level_instructions (no fallbacks/defaults)
+            if high_level_instructions is None:
+                raise ValueError("High-level instructions were not produced. The policy must return a string per batch item.")
+            if not isinstance(high_level_instructions, list):
+                raise TypeError(f"high_level_instructions must be a list of strings, got {type(high_level_instructions)}")
+            if len(high_level_instructions) != batch_size:
+                raise ValueError(f"high_level_instructions length {len(high_level_instructions)} does not match batch_size {batch_size}")
+            for idx in [i for i, d in enumerate(already_dones) if not d]:
+                instr = high_level_instructions[idx]
+                if not isinstance(instr, str) or instr.strip() == "":
+                    raise ValueError(f"Empty or invalid high-level instruction at index {idx}. The policy must provide a non-empty instruction.")
 
             # Generate actions for unfinished environments using rejection sampling
             selected_actions = []
@@ -414,6 +439,7 @@ def collect_rollout(
             
             # Step 1: Prepare all candidates for all unfinished states at once
             N = config.model.rejection_candidates
+            
             all_candidate_states = []
             all_candidate_base_states = []
             all_candidate_instructions = []
@@ -518,11 +544,14 @@ def collect_rollout(
                         chunk_scores = -(perplexity_scores - perplexity_mean) / perplexity_std
                     else:
                         chunk_scores = -(perplexity_scores - perplexity_mean)
+                    
+                    # Clean up perplexity-specific tensors
+                    del action_texts, perplexity_scores, perplexity_mean, perplexity_std
                         
                 elif use_combined:
                     perplexity_start_weight = getattr(config.model, 'perplexity_start_weight', 1.0)
                     perplexity_end_weight = getattr(config.model, 'perplexity_end_weight', 0.4)
-                    perplexity_decay_episodes = getattr(config.model, 'perplexity_decay_episodes', 50)
+                    perplexity_decay_episodes = getattr(config.model, 'perplexity_decay_episodes', 100)
                     chunk_scores = agent_trainer.compute_combined_rejection_score(
                         state_tokens, action_tokens_padded, base_state_tokens, environment, tokenizer,
                         current_episode=episode,
@@ -533,18 +562,20 @@ def collect_rollout(
                 else:
                     # Fallback to original v_high scoring
                     chunk_scores = agent_trainer.v_high(state_tokens, action_tokens_padded, base_state_tokens, environment)
+                
+                # Convert to CPU and extend scores list immediately
                 all_candidate_scores.extend(chunk_scores.cpu().tolist())
                 
-                # Clean up chunk tensors to prevent memory accumulation
+                # AGGRESSIVE CLEANUP: Delete all intermediate tensors immediately
                 del state_tokens, action_tokens_padded, base_state_tokens, chunk_scores
+                del chunk_states, chunk_actions, chunk_base_states
+                
+                # Force garbage collection and GPU cache cleanup after each chunk
+                import gc
+                gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
             # Step 4: Select best candidate for each state using epsilon-greedy
-            selected_actions = []
-            selected_action_tokens = []
-            selected_log_probs = []
-            selected_candidate_indices = []
-            
             for state_idx in unfinished_indices:
                 # Find all candidates for this state
                 state_candidate_indices = [i for i, mapped_idx in enumerate(state_to_candidate_mapping) if mapped_idx == state_idx]
@@ -581,7 +612,7 @@ def collect_rollout(
                     elif use_combined:
                         perplexity_start_weight = getattr(config.model, 'perplexity_start_weight', 1.0)
                         perplexity_end_weight = getattr(config.model, 'perplexity_end_weight', 0.4)
-                        perplexity_decay_episodes = getattr(config.model, 'perplexity_decay_episodes', 50)
+                        perplexity_decay_episodes = getattr(config.model, 'perplexity_decay_episodes', 100)
                         
                         # Compute current annealed weights for display
                         progress = min(episode / perplexity_decay_episodes, 1.0)
@@ -598,11 +629,16 @@ def collect_rollout(
                     print(f"  Selection method: {selection_method}")
                     print(f"  Selected action preview: {all_candidate_actions[selected_candidate_idx][:100]}...")
             
-            # Clean up rejection sampling tensors to prevent memory accumulation
+            # PARTIAL CLEANUP: Clean up large candidate tensors but keep selected ones
             del all_candidate_states, all_candidate_base_states, all_candidate_instructions
             del all_candidate_actions, all_candidate_action_tokens, all_candidate_log_probs
             del all_candidate_scores, state_to_candidate_mapping
+            
+            # Force garbage collection and GPU cache cleanup after rejection sampling
+            import gc
+            gc.collect()
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
             # Now, build the batch for the environment step
             # For finished envs, fill with dummy actions (e.g., empty string or pad tokens)
             batch_actions = []
@@ -618,6 +654,9 @@ def collect_rollout(
                     batch_actions.append(selected_actions[j])
                     batch_action_tokens.append(selected_action_tokens[j])
                     batch_log_probs.append(selected_log_probs[j])
+
+            # FINAL CLEANUP: Now clean up the selected candidate lists after using them
+            del selected_actions, selected_action_tokens, selected_log_probs, selected_candidate_indices
 
             # Use the carefully selected candidates from rejection sampling
             # (The candidates were selected above using either combined v_high + perplexity or just v_high scoring with epsilon-greedy exploration)
@@ -768,8 +807,30 @@ def collect_rollout(
                     # Store high-level policy data if available
                     if chosen_strategy_indices is not None and chosen_strategy_indices[i] is not None:
                         high_level_actions.append(torch.tensor(chosen_strategy_indices[i], dtype=torch.long))
-                        if current_high_level_log_probs is not None and current_high_level_log_probs[i] is not None:
-                            high_level_log_probs.append(torch.tensor(current_high_level_log_probs[i], dtype=torch.bfloat16))
+                        lp = current_high_level_log_probs[i] if current_high_level_log_probs is not None else None
+                        # Only append if lp is not None and not empty
+                        if lp is not None:
+                            if isinstance(lp, torch.Tensor):
+                                if lp.numel() > 0:
+                                    lp_tensor = lp.detach().to(dtype=torch.bfloat16)
+                                    if lp_tensor.numel() == 1:
+                                        lp_tensor = lp_tensor.reshape(())
+                                    lp_tensor = lp_tensor.to(agent_trainer.device)
+                                    high_level_log_probs.append(lp_tensor)
+                                else:
+                                    high_level_log_probs.append(None)
+                            elif hasattr(lp, '__len__'):
+                                if len(lp) > 0:
+                                    lp_tensor = torch.tensor(lp, dtype=torch.bfloat16)
+                                    if lp_tensor.numel() == 1:
+                                        lp_tensor = lp_tensor.reshape(())
+                                    lp_tensor = lp_tensor.to(agent_trainer.device)
+                                    high_level_log_probs.append(lp_tensor)
+                                else:
+                                    high_level_log_probs.append(None)
+                            else:
+                                # Scalar number path
+                                high_level_log_probs.append(torch.tensor(lp, dtype=torch.bfloat16).to(agent_trainer.device))
                         else:
                             high_level_log_probs.append(None)
                     else:
@@ -827,7 +888,6 @@ def collect_rollout(
             # Clean up step-level variables to prevent memory accumulation
             del batch_actions, batch_action_tokens, batch_log_probs
             del next_state, responses, reward, done
-            del selected_actions, selected_action_tokens, selected_log_probs, selected_candidate_indices
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
@@ -862,11 +922,23 @@ def collect_rollout(
     
     # Create rollout data
     # Filter out None values for high-level policy data
-    valid_high_level_actions = [a for a in high_level_actions if a is not None]
-    valid_high_level_log_probs = [lp for lp in high_level_log_probs if lp is not None]
-    
+    valid_pairs = [
+        (a, lp)
+        for a, lp in zip(high_level_actions, high_level_log_probs)
+        if a is not None and lp is not None and lp.numel() > 0
+    ]
+    valid_high_level_actions = [a for a, lp in valid_pairs]
+    valid_high_level_log_probs = [lp for a, lp in valid_pairs]
 
-    
+    # Require scalar log-probs; reshape any singletons to 0-d scalars and fail if not exactly one element
+    if valid_high_level_log_probs:
+        for idx, lp in enumerate(valid_high_level_log_probs):
+            assert isinstance(lp, torch.Tensor), f"Expected tensor log prob at index {idx}, got {type(lp)}"
+            assert lp.numel() == 1, f"High-level log prob at index {idx} must have exactly one element, got shape {lp.shape}"
+        valid_high_level_log_probs = [lp.reshape(()) for lp in valid_high_level_log_probs]
+        # Ensure all tensors are on the same device (GPU)
+        valid_high_level_log_probs = [lp.to(agent_trainer.device) for lp in valid_high_level_log_probs]
+
     high_level_actions_tensor = torch.stack(valid_high_level_actions) if valid_high_level_actions else None
     high_level_log_probs_tensor = torch.stack(valid_high_level_log_probs) if valid_high_level_log_probs else None
     
@@ -923,7 +995,8 @@ class AgentTrainer:
         use_token_masked_computation: bool = True,
         minibatch_size: int = 8,
         config: Optional[Any] = None,
-        gamma: float = 0.99
+        gamma: float = 0.99,
+        hl_only_training: bool = False
     ) -> None:
         """
         Initialize the agent trainer with model swapping support for DeepSpeed compatibility.
@@ -949,6 +1022,7 @@ class AgentTrainer:
             minibatch_size: Size of minibatches for training
             config: Configuration object
             gamma: Discount factor
+            hl_only_training: Whether to train only the high-level policy
         """
         self.actor_optimizer = actor_optimizer
         self.sequence_critic_optimizer = sequence_critic_optimizer
@@ -970,6 +1044,7 @@ class AgentTrainer:
         self.minibatch_size = minibatch_size
         self.config = config
         self.gamma = gamma
+        self.hl_only_training = hl_only_training
         
         # Learning rate annealing tracking
         self.current_episode = 0
@@ -996,6 +1071,8 @@ class AgentTrainer:
             self.device = torch.device(device)
             
         print(f"AgentTrainer initialized with model swapping {'enabled' if self.model_swap_enabled else 'disabled'}")
+        if self.hl_only_training:
+            print("HL-ONLY TRAINING MODE: Will skip low-level actor and token critic training")
     
     def compute_annealing_factor(self, episode: int) -> float:
         """
@@ -1091,8 +1168,12 @@ class AgentTrainer:
         for name, model in self.agent_models.items():
             if model is not None:
                 try:
-                    model.to('cpu')
-                    print(f"Moved {name} to CPU")
+                    # Skip moving models that are sharded via device_map
+                    if hasattr(model, 'hf_device_map') and model.hf_device_map:
+                        print(f"Skipping CPU move for sharded model: {name}")
+                    else:
+                        model.to('cpu')
+                        print(f"Moved {name} to CPU")
                 except Exception as e:
                     print(f"Warning: Failed to move {name} to CPU: {e}")
         
@@ -1110,8 +1191,12 @@ class AgentTrainer:
         for name, model in self.agent_models.items():
             if model is not None:
                 try:
-                    model.to(self.device)
-                    print(f"Moved {name} to GPU")
+                    # Skip moving models that are sharded via device_map
+                    if hasattr(model, 'hf_device_map') and model.hf_device_map:
+                        print(f"Skipping GPU move for sharded model: {name}")
+                    else:
+                        model.to(self.device)
+                        print(f"Moved {name} to GPU")
                 except Exception as e:
                     print(f"Warning: Failed to move {name} to GPU: {e}")
         
@@ -1165,8 +1250,14 @@ class AgentTrainer:
         Returns:
             Q-values for full sequences: R(s') - R(a)
         """
-        # BOTTLENECK: Repeated tokenizer access and text conversion
-        tokenizer = environment.get_target_tokenizer()
+        # Prefer actor/policy tokenizer; fallback to environment if available
+        policy = self.agent_models.get('policy') if hasattr(self, 'agent_models') else None
+        tokenizer = getattr(policy, 'tokenizer', None)
+        if tokenizer is None and hasattr(environment, 'get_target_tokenizer'):
+            tokenizer = environment.get_target_tokenizer()
+        if tokenizer is None:
+            raise AttributeError("No tokenizer available: policy.tokenizer missing and environment lacks get_target_tokenizer()")
+
         action_texts = self._batch_decode_with_timeout(tokenizer, action, skip_special_tokens=True)
         state_texts = self._batch_decode_with_timeout(tokenizer, state, skip_special_tokens=True)
         
@@ -1179,6 +1270,10 @@ class AgentTrainer:
         try:
             # Check if we should use R(s') - R(a) formula or just R(a)
             use_rs_minus_ra = getattr(self.config.training, 'use_rs_minus_ra_reward', True)
+            # Disable R(s') - R(a) explicitly for MultiTurnMultipleChoiceEnv
+            from src.general.mc_multiturn_env import MultiTurnMultipleChoiceEnv
+            if isinstance(environment, MultiTurnMultipleChoiceEnv):
+                use_rs_minus_ra = False
             
             # R(a): Safety score of the agent's action
             action_safety_scores = environment.score_safety(action_texts, questions=state_texts, reference_state=base_state_texts)
@@ -1248,10 +1343,6 @@ class AgentTrainer:
                         print(f"    R(s') - R(a): {reward_scores[i].item():.4f}")
                         print(f"    Interpretation: {'Good (target safer than agent)' if reward_scores[i] > 0 else 'Bad (agent safer than target)'}")
                         print()
-                    
-                    print("="*80)
-                    print("END SANITY CHECK")
-                    print("="*80 + "\n")
             else:
                 # Original behavior: just use R(a)
                 reward_scores = action_safety_scores
@@ -1333,6 +1424,9 @@ class AgentTrainer:
             pairwise_masking = getattr(self.config.training, "pairwise_marginal_masking", False)
 
         use_q_as_reward = getattr(self.config.training, "Q_as_reward", False)
+        from src.general.mc_multiturn_env import MultiTurnMultipleChoiceEnv
+        if isinstance(environment, MultiTurnMultipleChoiceEnv):
+            use_q_as_reward = True
 
         batch_size, action_len = action.shape
         
@@ -1426,19 +1520,16 @@ class AgentTrainer:
                 # Ensure sequence_critic is on GPU since it's passed as parameter
                 sequence_critic.to(self.device)
                 
-                # Get attention weights from sequence critic
+                # Get last hidden states from sequence critic to derive token importance cheaply
                 with torch.no_grad():
-                    _, attention_weights = sequence_critic(
+                    _, last_hidden = sequence_critic(
                         input_ids=action,
                         attention_mask=action_attention_mask,
-                        return_attention=True
+                        return_last_hidden=True
                     )
                 
-                # Extract attention weights (use last layer, last head as heuristic for importance)
-                # attention_weights is tuple of tensors: (num_layers, batch_size, num_heads, seq_len, seq_len)
-                last_layer_attention = attention_weights[-1]  # Last layer
-                # Average across heads to get per-token importance: [batch_size, seq_len]
-                token_importance = last_layer_attention.mean(dim=1).mean(dim=-1)  # Mean over heads and source positions
+                # Derive per-token importance as L2 norm of hidden states: [batch_size, seq_len]
+                token_importance = last_hidden.norm(p=2, dim=-1)
                 
                 # Select top-k most important tokens for each sequence in the batch
                 valid_token_positions = []
@@ -1537,18 +1628,20 @@ class AgentTrainer:
             pairwise_count: Dict[int, int] = {}
 
             if all_masked_attentions:
-                # Use smaller chunk size for Q-as-reward to reduce memory usage
-                if use_q_as_reward:
-                    max_chunk_size = min(2, self.config.training.batch_size)  # Smaller chunks for Q-as-reward
-                else:
-                    max_chunk_size = self.config.training.batch_size
+                # Use minibatch_size for marginal reward chunking (same as actor training)
+                # This ensures we process the same number of samples per chunk as actor training
+                max_chunk_size = self.config.training.minibatch_size
                 
-                # Process in chunks 
+                # Process in chunks using minibatch_size
+                total_chunks = (len(all_masked_attentions) + max_chunk_size - 1) // max_chunk_size
+                print(f"Processing {len(all_masked_attentions)} masked versions in {total_chunks} chunks of size {max_chunk_size}")
+                print(f"GPU memory usage: {self._get_available_gpu_memory_gb():.2f} GB")
                 for chunk_start in range(0, len(all_masked_attentions), max_chunk_size):
                     chunk_end = min(chunk_start + max_chunk_size, len(all_masked_attentions))
                     chunk_attentions = all_masked_attentions[chunk_start:chunk_end]
                     chunk_infos = mask_info[chunk_start:chunk_end]
                     chunk_size = len(chunk_attentions)
+                    print(f"Processing chunk {chunk_start//max_chunk_size + 1}/{total_chunks} ({chunk_size} samples)")
                     # Process this chunk
                     if use_q_as_reward:
                         # Build inputs per mask for sequence critic
@@ -1905,8 +1998,7 @@ class AgentTrainer:
         environment: Any = None,
         tokenizer: Any = None,
         instructions: Optional[List[str]] = None,
-        v_low_targets: Optional[torch.Tensor] = None,
-        v_high_critic: Optional[nn.Module] = None
+        v_low_targets: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Train both sequence-level and token-level critics.
@@ -2040,94 +2132,47 @@ class AgentTrainer:
         # ------------------------------------------------------------------
         # TRAIN TOKEN-LEVEL CRITIC (now that the sequence-critic graph is gone)
         # ------------------------------------------------------------------
-        token_critic.train()
+        if token_critic is not None:
+            token_critic.train()
 
-        token_input = torch.cat([state, action], dim=1)
-        token_attention_mask = (token_input != tokenizer.pad_token_id).long().to(device=device)
+            token_input = torch.cat([state, action], dim=1)
+            token_attention_mask = (token_input != tokenizer.pad_token_id).long().to(device=device)
 
-        token_value_current = token_critic(
-            input_ids=token_input,
-            attention_mask=token_attention_mask,
-            requires_grad=True
-        )
-
-        if token_value_current.dim() > 1 and token_value_current.size(-1) == 1:
-            token_value_current = token_value_current.squeeze(-1)
-
-        # For per-token RL, extract only the action tokens from the critic output
-        # token_value_current has shape [batch_size, state_len + action_len]
-        # We need only the action tokens: [batch_size, action_len]
-        state_len = state.size(1)
-        token_value_current = token_value_current[:, state_len:]  # Extract action tokens only
-
-        # Ensure correct dtype for all tensors
-        token_value_current = token_value_current.to(dtype=model_dtype)
-
-        if v_low_targets.dim() == 0:
-            v_low_targets = v_low_targets.unsqueeze(0)
-
-        token_critic_loss = F.mse_loss(token_value_current, v_low_targets)
-
-        self.token_critic_optimizer.zero_grad()
-        token_critic_loss.backward()
-
-        if self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(token_critic.parameters(), self.max_grad_norm)
-
-        self.token_critic_optimizer.step()
-
-        # ------------------------------------------------------------------
-        # TRAIN V_HIGH CRITIC (if provided)
-        # ------------------------------------------------------------------
-        v_high_critic_loss = None
-        if v_high_critic is not None and environment is not None:
-            v_high_critic.train()
-            
-            # Prepare input for v_high critic: concatenate state and action
-            v_high_input = torch.cat([state, action], dim=1)
-            v_high_attention_mask = (v_high_input != tokenizer.pad_token_id).long().to(device=device)
-            
-            # Get prediction from v_high critic
-            v_high_value_current = v_high_critic(
-                input_ids=v_high_input,
-                attention_mask=v_high_attention_mask,
+            token_value_current = token_critic(
+                input_ids=token_input,
+                attention_mask=token_attention_mask,
                 requires_grad=True
             )
-            
-            if v_high_value_current.dim() > 1 and v_high_value_current.size(-1) == 1:
-                v_high_value_current = v_high_value_current.squeeze(-1)
-            
-            # Ensure correct dtype for all tensors
-            v_high_value_current = v_high_value_current.to(dtype=model_dtype)
-            
-            # Compute target: q_high(state, action, base_state, environment)
-            with torch.no_grad():
-                v_high_targets = self.q_high(state, action, base_state, environment)
-                v_high_targets = v_high_targets.to(device=device, dtype=model_dtype)
-            
-            # Matching target shape
-            if v_high_targets.dim() == 0:
-                v_high_targets = v_high_targets.unsqueeze(0)
-            
-            # Compute loss: MSE between v_high critic prediction and q_high target
-            v_high_critic_loss = F.mse_loss(v_high_value_current, v_high_targets)
-            assert v_high_critic_loss.grad_fn is not None
-            
-            # Train v_high critic (assuming it has its own optimizer)
-            # Note: This assumes v_high_critic has an optimizer attribute
-            if hasattr(v_high_critic, 'optimizer'):
-                v_high_critic.optimizer.zero_grad()
-                v_high_critic_loss.backward()
-                
-                if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(v_high_critic.parameters(), self.max_grad_norm)
-                
-                v_high_critic.optimizer.step()
-            
-            # Clean up v_high critic tensors
-            del v_high_value_current, v_high_input, v_high_attention_mask, v_high_targets
-            torch.cuda.empty_cache()
 
+            if token_value_current.dim() > 1 and token_value_current.size(-1) == 1:
+                token_value_current = token_value_current.squeeze(-1)
+
+            # For per-token RL, extract only the action tokens from the critic output
+            # token_value_current has shape [batch_size, state_len + action_len]
+            # We need only the action tokens: [batch_size, action_len]
+            state_len = state.size(1)
+            token_value_current = token_value_current[:, state_len:]  # Extract action tokens only
+
+            # Ensure correct dtype for all tensors
+            token_value_current = token_value_current.to(dtype=model_dtype)
+
+            if v_low_targets.dim() == 0:
+                v_low_targets = v_low_targets.unsqueeze(0)
+
+            token_critic_loss = F.mse_loss(token_value_current, v_low_targets)
+
+            self.token_critic_optimizer.zero_grad()
+            token_critic_loss.backward()
+
+            if self.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(token_critic.parameters(), self.max_grad_norm)
+
+            self.token_critic_optimizer.step()
+        else:
+            # Token critic is None (HL-only mode), create dummy loss
+            token_critic_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+
+        # ------------------------------------------------------------------
         # Final cleanup to keep the GPU tidy
         del token_value_current, token_input, token_attention_mask
         torch.cuda.empty_cache()
@@ -2138,8 +2183,8 @@ class AgentTrainer:
             'token_critic_loss': token_critic_loss.item(),
         }
         
-        if v_high_critic_loss is not None:
-            result['v_high_critic_loss'] = v_high_critic_loss.item()
+        if token_critic is None:
+            result['token_critic_loss'] = 0.0  # Ensure token critic loss is 0 in HL-only mode
         
         return result
 
@@ -2257,79 +2302,98 @@ class AgentTrainer:
             torch.nn.utils.clip_grad_norm_(sequence_critic.parameters(), self.max_grad_norm)
         self.sequence_critic_optimizer.step()
         
+        # CRITICAL: Clear gradients and move processed tensors off GPU after optimizer step
+        self.sequence_critic_optimizer.zero_grad()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # ------------------------------------------------------------------
         # TRAIN TOKEN-LEVEL CRITIC (CHUNKED)
         # ------------------------------------------------------------------
-        token_critic.train()
-        self.token_critic_optimizer.zero_grad()
+        if token_critic is not None:
+            token_critic.train()
+            self.token_critic_optimizer.zero_grad()
+            
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                
+                # Get chunk data - keep token IDs as integers, don't convert to model dtype
+                chunk_state = state[i:end_idx].to(device=device)  # Keep as Long for embeddings
+                chunk_action = action[i:end_idx].to(device=device)  # Keep as Long for embeddings
+                
+                # Use override targets if provided, otherwise use default targets
+                if v_low_targets_override is not None:
+                    chunk_targets = v_low_targets_override[i:end_idx].to(device=device, dtype=model_dtype)
+                else:
+                    chunk_targets = v_low_targets[i:end_idx].to(device=device, dtype=model_dtype)
+                
+                # Process chunk
+                chunk_token_input = torch.cat([chunk_state, chunk_action], dim=1)
+                chunk_token_attention_mask = (chunk_token_input != tokenizer.pad_token_id).long().to(device=device)
+                
+                chunk_token_value = token_critic(
+                    input_ids=chunk_token_input,
+                    attention_mask=chunk_token_attention_mask,
+                    requires_grad=True
+                )
+                
+                if chunk_token_value.dim() > 1 and chunk_token_value.size(-1) == 1:
+                    chunk_token_value = chunk_token_value.squeeze(-1)
+                
+                # For per-token RL, extract only the action tokens from the critic output
+                # chunk_token_value has shape [chunk_size, state_len + action_len]
+                # We need only the action tokens: [chunk_size, action_len]
+                state_len = chunk_state.size(1)
+                chunk_token_value = chunk_token_value[:, state_len:]  # Extract action tokens only
+                
+                # Ensure correct dtype for all tensors
+                chunk_token_value = chunk_token_value.to(dtype=model_dtype)
+                
+                # Matching target shape
+                if chunk_targets.dim() == 0:
+                    chunk_targets = chunk_targets.unsqueeze(0)
+                
+                # Calculate loss for this chunk - ensure correct dtype
+                chunk_token_loss = F.mse_loss(chunk_token_value, chunk_targets)
+                
+                # Scale loss by chunk size for proper averaging - ensure correct dtype
+                chunk_weight = torch.tensor(len(chunk_state) / batch_size, device=device, dtype=model_dtype)
+                scaled_loss = chunk_token_loss * chunk_weight
+                
+                # Backward pass
+                scaled_loss.backward()
+                
+                # Accumulate loss
+                total_token_loss += chunk_token_loss.item() * chunk_weight.item()
+                
+                # Clean up chunk tensors
+                del chunk_state, chunk_action, chunk_targets
+                del chunk_token_input, chunk_token_attention_mask
+                del chunk_token_value, chunk_token_loss, scaled_loss, chunk_weight
+                torch.cuda.empty_cache()
+            
+            # Update token critic
+            if self.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(token_critic.parameters(), self.max_grad_norm)
+            self.token_critic_optimizer.step()
+            
+            # CRITICAL: Clear gradients and move processed tensors off GPU after optimizer step
+            self.token_critic_optimizer.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            # Token critic is None (HL-only mode), set loss to 0
+            total_token_loss = 0.0
         
-        for i in range(0, batch_size, chunk_size):
-            end_idx = min(i + chunk_size, batch_size)
-            
-            # Get chunk data - keep token IDs as integers, don't convert to model dtype
-            chunk_state = state[i:end_idx].to(device=device)  # Keep as Long for embeddings
-            chunk_action = action[i:end_idx].to(device=device)  # Keep as Long for embeddings
-            
-            # Use override targets if provided, otherwise use default targets
-            if v_low_targets_override is not None:
-                chunk_targets = v_low_targets_override[i:end_idx].to(device=device, dtype=model_dtype)
-            else:
-                chunk_targets = v_low_targets[i:end_idx].to(device=device, dtype=model_dtype)
-            
-            # Process chunk
-            chunk_token_input = torch.cat([chunk_state, chunk_action], dim=1)
-            chunk_token_attention_mask = (chunk_token_input != tokenizer.pad_token_id).long().to(device=device)
-            
-            chunk_token_value = token_critic(
-                input_ids=chunk_token_input,
-                attention_mask=chunk_token_attention_mask,
-                requires_grad=True
-            )
-            
-            if chunk_token_value.dim() > 1 and chunk_token_value.size(-1) == 1:
-                chunk_token_value = chunk_token_value.squeeze(-1)
-            
-            # For per-token RL, extract only the action tokens from the critic output
-            # chunk_token_value has shape [chunk_size, state_len + action_len]
-            # We need only the action tokens: [chunk_size, action_len]
-            state_len = chunk_state.size(1)
-            chunk_token_value = chunk_token_value[:, state_len:]  # Extract action tokens only
-            
-            # Ensure correct dtype for all tensors
-            chunk_token_value = chunk_token_value.to(dtype=model_dtype)
-            
-            # Matching target shape
-            if chunk_targets.dim() == 0:
-                chunk_targets = chunk_targets.unsqueeze(0)
-            
-            # Calculate loss for this chunk - ensure correct dtype
-            chunk_token_loss = F.mse_loss(chunk_token_value, chunk_targets)
-            
-            # Scale loss by chunk size for proper averaging - ensure correct dtype
-            chunk_weight = torch.tensor(len(chunk_state) / batch_size, device=device, dtype=model_dtype)
-            scaled_loss = chunk_token_loss * chunk_weight
-            
-            # Backward pass
-            scaled_loss.backward()
-            
-            # Accumulate loss
-            total_token_loss += chunk_token_loss.item() * chunk_weight.item()
-            
-            # Clean up chunk tensors
-            del chunk_state, chunk_action, chunk_targets
-            del chunk_token_input, chunk_token_attention_mask
-            del chunk_token_value, chunk_token_loss, scaled_loss, chunk_weight
-            torch.cuda.empty_cache()
-        
-        # Update token critic
-        if self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(token_critic.parameters(), self.max_grad_norm)
-        self.token_critic_optimizer.step()
-        
-        return {
+        result = {
             'sequence_critic_loss': total_sequence_loss,
             'token_critic_loss': total_token_loss,
         }
+        
+        if token_critic is None:
+            result['token_critic_loss'] = 0.0  # Ensure token critic loss is 0 in HL-only mode
+        
+        return result
 
     def train_high_level_policy(
         self,
@@ -2548,6 +2612,11 @@ class AgentTrainer:
                 torch.nn.utils.clip_grad_norm_(high_level_policy.parameters(), self.max_grad_norm)
             
             self.high_level_optimizer.step()
+            
+            # CRITICAL: Clear gradients and move processed tensors off GPU after optimizer step
+            self.high_level_optimizer.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         return {
             'high_level_policy_loss': total_actor_loss,
@@ -2589,7 +2658,8 @@ class AgentTrainer:
         seq_len = state.shape[1] + action.shape[1]
         
         # Use chunking if enabled or if sequence is too long
-        if actor_chunking_enabled or (batch_size * seq_len > 2048):
+        actor_chunk_threshold = getattr(self.config.training, 'actor_chunk_threshold', 2048)
+        if actor_chunking_enabled or (batch_size * seq_len > actor_chunk_threshold):
             return self._train_actor_chunked(
                 actor=actor,
                 state=state,
@@ -2724,32 +2794,44 @@ class AgentTrainer:
 
         # Add entropy, perplexity and KL losses below (move earlier code accordingly)
 
-        # Apply token-level safety guidance if available from environment
-        if self.use_token_masked_computation and environment.compute_safety_logits:
+        # Apply token-level guidance (safety or task-completion) if available
+        if self.use_token_masked_computation:
             # Get tokenizer from actor or environment
-            tokenizer = actor.tokenizer or environment.get_target_tokenizer()
-                
+            tokenizer = getattr(actor, 'tokenizer', None)
+            if tokenizer is None and hasattr(environment, 'get_target_tokenizer'):
+                tokenizer = environment.get_target_tokenizer()
+            if tokenizer is None:
+                raise AttributeError("No tokenizer available for token-masked computation")
+
             # Decode actions to text
             action_texts = self._batch_decode_with_timeout(tokenizer, action, skip_special_tokens=True)
-            
-            # Get token-level safety scores from environment
-            safety_logits = environment.compute_safety_logits(action_texts)
-            
-            # Create token-level safety mask (focusing optimization on unsafe tokens)
-            if safety_logits is not None:
-                # Map safety logits to token positions in the original tokens
+
+            # For MultiTurnMultipleChoiceEnv, use the task-completion judge score instead of safety
+            from src.general.mc_multiturn_env import MultiTurnMultipleChoiceEnv
+            if isinstance(environment, MultiTurnMultipleChoiceEnv):
+                if base_state is None:
+                    raise ValueError("base_state is required for task-completion token-masked computation in MCQ env")
+                base_state_texts = [self._decode_with_timeout(tokenizer, base_state[i], skip_special_tokens=True) for i in range(len(base_state))]
+                # Judge returns [0,1]; higher means better completion. Upweight low-completion cases.
+                judge_scores = environment.score_safety(action_texts, questions=action_texts, reference_state=base_state_texts)
                 batch_size = advantages.shape[0]
                 modified_advantages = advantages.clone()
-                
                 for i in range(batch_size):
-                    # Scale advantages based on safety logits
-                    if i < len(safety_logits):
-                        safety_score = torch.sigmoid(safety_logits[i]).mean()
-                        # Emphasize advantage for potentially unsafe responses
-                        modified_advantages[i] = advantages[i] * (1.0 + (1.0 - safety_score) * 0.5)
-                
-                # Use modified advantages in PPO calculation
+                    if i < len(judge_scores):
+                        comp = judge_scores[i].clamp(0.0, 1.0)
+                        modified_advantages[i] = advantages[i] * (1.0 + (1.0 - comp) * 0.5)
                 advantages = modified_advantages
+            elif hasattr(environment, 'compute_safety_logits'):
+                # Fallback to safety-based guidance
+                safety_logits = environment.compute_safety_logits(action_texts)
+                if safety_logits is not None:
+                    batch_size = advantages.shape[0]
+                    modified_advantages = advantages.clone()
+                    for i in range(batch_size):
+                        if i < len(safety_logits):
+                            safety_score = torch.sigmoid(safety_logits[i]).mean()
+                            modified_advantages[i] = advantages[i] * (1.0 + (1.0 - safety_score) * 0.5)
+                    advantages = modified_advantages
         
         # -------------------------------------------------------------------
         # NaN/Inf diagnostics – fail fast with detailed info
@@ -3045,6 +3127,11 @@ class AgentTrainer:
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), self.max_grad_norm)
             self.actor_optimizer.step()
         
+        # CRITICAL: Clear gradients and move processed tensors off GPU after optimizer step
+        self.actor_optimizer.zero_grad()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return {
             'actor_loss': total_actor_loss,
             'entropy_loss': total_entropy_loss,
@@ -3064,7 +3151,6 @@ class AgentTrainer:
         environment: Any = None,
         tokenizer: Any = None,
         high_level_policy: Optional[nn.Module] = None,
-        v_high_critic: Optional[nn.Module] = None,
         num_epochs: int = 3,
         compute_advantage_fn: Optional[Callable] = None
     ) -> Dict[str, Any]:
@@ -3137,11 +3223,7 @@ class AgentTrainer:
             use_per_token_advantages = getattr(self.config.training, 'use_per_token_advantages', True)
             
             if use_per_token_advantages:
-                # STANDARD PPO: Use critic network for value estimates
-                # This follows the standard PPO approach where:
-                # 1. Critic predicts values: V(s) = critic(state)
-                # 2. Advantages computed using critic: A(s,a) = GAE with critic values  
-                # 3. Critic trained to predict returns: critic_loss = MSE(critic(state), returns)
+                # This follows the standard PPO approach 
                 with torch.no_grad():
                     # Get critic predictions for current state-action pairs
                     token_input = torch.cat([state, action], dim=1)
@@ -3269,12 +3351,15 @@ class AgentTrainer:
                 high_level_advantages = high_level_values.clone().detach()
         
         # Train for multiple epochs
+        if self.hl_only_training:
+            print(f"[HL-ONLY MODE] Starting training loop - will skip low-level actor and token critic training")
+        
         metrics = {
             'actor_loss': 0,
             'perplexity': 0,
             'sequence_critic_loss': 0,
             'token_critic_loss': 0,
-            'v_high_critic_loss': 0,
+
             'kl_div': 0,
             'entropy_loss': 0,
             'total_loss': 0
@@ -3283,32 +3368,66 @@ class AgentTrainer:
         for epoch in range(num_epochs):
             # Train critics
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Training critics")
-            critic_metrics = self.train_critics(
-                sequence_critic=sequence_critic,
-                token_critic=token_critic,
-                state=state,
-                action=action,
-                base_state=base_state,
-                reward=rewards,
-                next_state=next_state,
-                environment=environment,
-                tokenizer=tokenizer,
-                instructions=getattr(batch_data, 'high_level_instructions', None),
-                v_low_targets=low_level_returns if 'low_level_returns' in locals() else None,
-                v_high_critic=v_high_critic
-            )
+            if self.hl_only_training:
+                # In HL-only mode, only train sequence critic (for high-level policy advantages)
+                # Skip token critic training since we won't train the low-level actor
+                print("[HL-ONLY MODE] Skipping token critic training")
+                critic_metrics = self.train_critics(
+                    sequence_critic=sequence_critic,
+                    token_critic=None,  # Skip token critic
+                    state=state,
+                    action=action,
+                    base_state=base_state,
+                    reward=rewards,
+                    next_state=next_state,
+                    environment=environment,
+                    tokenizer=tokenizer,
+                    instructions=getattr(batch_data, 'high_level_instructions', None),
+                    v_low_targets=low_level_returns if 'low_level_returns' in locals() else None,
+                )
+            else:
+                # Normal mode: train both critics
+                critic_metrics = self.train_critics(
+                    sequence_critic=sequence_critic,
+                    token_critic=token_critic,
+                    state=state,
+                    action=action,
+                    base_state=base_state,
+                    reward=rewards,
+                    next_state=next_state,
+                    environment=environment,
+                    tokenizer=tokenizer,
+                    instructions=getattr(batch_data, 'high_level_instructions', None),
+                    v_low_targets=low_level_returns if 'low_level_returns' in locals() else None,
+                )
             
-            # Train low-level actor
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Training low-level actor")
-            actor_metrics = self.train_actor(
-                actor=actor,
-                state=state,
-                action=action,
-                old_log_probs=old_log_probs,
-                advantages=low_level_advantages,
-                base_state=base_state,
-                environment=environment
-            )
+            # Train low-level actor (skip if hl_only_training)
+            if self.hl_only_training:
+                print("[HL-ONLY MODE] Skipping low-level actor training")
+                # Create dummy actor metrics for compatibility
+                actor_metrics = {
+                    'actor_loss': 0.0,
+                    'entropy_loss': 0.0,
+                    'kl_div': 0.0,
+                    'perplexity_loss': 0.0,
+                    'total_loss': 0.0,
+                    'actor_grad_norm': 0.0,
+                    'perplexity_grad_norm': 0.0,
+                    'ratio_mean': 0.0,
+                    'ratio_min': 0.0,
+                    'ratio_max': 0.0
+                }
+            else:
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Training low-level actor")
+                actor_metrics = self.train_actor(
+                    actor=actor,
+                    state=state,
+                    action=action,
+                    old_log_probs=old_log_probs,
+                    advantages=low_level_advantages,
+                    base_state=base_state,
+                    environment=environment
+                )
             # Train high-level policy if provided
             if high_level_policy is not None:
                 policy_kind = getattr(high_level_policy, "policy_kind", None)
@@ -3374,8 +3493,7 @@ class AgentTrainer:
             metrics['perplexity'] += actor_metrics['perplexity_loss']
             metrics['sequence_critic_loss'] += critic_metrics['sequence_critic_loss']
             metrics['token_critic_loss'] += critic_metrics['token_critic_loss']
-            if 'v_high_critic_loss' in critic_metrics:
-                metrics['v_high_critic_loss'] += critic_metrics['v_high_critic_loss']
+
             metrics['kl_div'] += actor_metrics['kl_div']
             metrics['entropy_loss'] += actor_metrics['entropy_loss']
             metrics['total_loss'] += actor_metrics['total_loss']
@@ -3390,6 +3508,10 @@ class AgentTrainer:
         num_epochs = max(1, num_epochs)  # Avoid division by zero
         for key in metrics:
             metrics[key] /= num_epochs
+        
+        # CRITICAL: Final memory cleanup after all training epochs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return metrics
     
@@ -3406,10 +3528,9 @@ class AgentTrainer:
         output_dir: str = "outputs",
         save_checkpoint_fn: Optional[Callable] = None,
         high_level_policy: Optional[nn.Module] = None,
-        v_high_critic: Optional[nn.Module] = None,
         templates_path: str = "src/configs/templates.json",
         episode_offset: int = 0
-    ) -> Tuple[nn.Module, nn.Module, nn.Module, Optional[nn.Module], List[float], str]:
+    ) -> Tuple[nn.Module, nn.Module, nn.Module, List[float], str]:
         """
         Main training loop for the agent.
         
@@ -3547,10 +3668,6 @@ class AgentTrainer:
                 self._log_gpu_memory("After train", flush=True)
             print(f"Training time: {time.time() - train_start_time:.2f}s")
             
-            # Clear all model caches between episodes to prevent memory accumulation
-            if hasattr(environment, 'clear_all_caches'):
-                environment.clear_all_caches()
-            
             # Calculate episode statistics
             mean_reward = rollout_data.batch_rews.mean().item()
             max_reward = rollout_data.batch_rews.max().item()
@@ -3567,6 +3684,24 @@ class AgentTrainer:
             # Capture peak GPU memory for this episode
             max_gpu_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
             metrics['max_gpu_allocated_gb'] = max_gpu_gb
+            
+            # EXTRACT DATA: Get necessary data from rollout_data before cleanup
+            batch_base_state = rollout_data.batch_base_state
+            high_level_actions = rollout_data.high_level_actions
+            conversations = rollout_data.conversations
+            
+            # Clear all model caches between episodes to prevent memory accumulation
+            if hasattr(environment, 'clear_all_caches'):
+                environment.clear_all_caches()
+            
+            # AGGRESSIVE MEMORY CLEANUP: Clear rollout data and force garbage collection
+            # Note: Keep metrics for checkpoint saving, will delete at episode end
+            del rollout_data
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
 
             # Enhanced episode summary logging
             print("=" * 80)
@@ -3652,11 +3787,11 @@ class AgentTrainer:
             csv_pairs_exists = os.path.isfile(pairs_csv_path)
 
             # Decode input texts (base state) back to strings
-            input_texts: List[str] = [tokenizer.decode(t.tolist(), skip_special_tokens=True) for t in rollout_data.batch_base_state]
+            input_texts: List[str] = [tokenizer.decode(t.tolist(), skip_special_tokens=True) for t in batch_base_state]
 
             # Retrieve corresponding discrete action numbers if available
-            if rollout_data.high_level_actions is not None:
-                action_numbers = rollout_data.high_level_actions.cpu().tolist()
+            if high_level_actions is not None:
+                action_numbers = high_level_actions.cpu().tolist()
                 if len(action_numbers) != len(input_texts):
                     raise ValueError(
                         f"Mismatch between number of actions (" \
@@ -3684,7 +3819,7 @@ class AgentTrainer:
                         output_dir=run_output_dir,
                         is_final=False,
                         high_level_policy=high_level_policy,
-                        v_high_critic=v_high_critic
+                        v_high_critic=None
                     )
                 else:
                     save_checkpoint_fn(
@@ -3696,6 +3831,12 @@ class AgentTrainer:
                         output_dir=run_output_dir,
                         is_final=False
                     )
+            # Final cleanup for this episode: delete extracted data and metrics after checkpoint saving
+            if 'metrics' in locals():
+                del metrics
+            if 'batch_base_state' in locals():
+                del batch_base_state, high_level_actions, conversations
+            
             # clear GPU memory on all devices
             if torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
@@ -3715,7 +3856,7 @@ class AgentTrainer:
                 output_dir=run_output_dir,
                 is_final=True,
                 high_level_policy=high_level_policy,
-                v_high_critic=v_high_critic
+                v_high_critic=None
             )
         else:
             save_checkpoint_fn(
@@ -3728,7 +3869,7 @@ class AgentTrainer:
                 is_final=True
             )
         
-        return policy, sequence_critic, token_critic, v_high_critic, episode_rewards, run_id
+        return policy, sequence_critic, token_critic, episode_rewards, run_id
     
     def _default_save_checkpoint(
         self,
@@ -3739,8 +3880,7 @@ class AgentTrainer:
         metrics: Dict[str, float],
         output_dir: str,
         is_final: bool = False,
-        high_level_policy: Optional[nn.Module] = None,
-        v_high_critic: Optional[nn.Module] = None
+        high_level_policy: Optional[nn.Module] = None
     ) -> None:
         """
         Default function to save model checkpoint.
@@ -3774,11 +3914,6 @@ class AgentTrainer:
         
         token_critic_path = os.path.join(checkpoint_dir, "token_critic")
         token_critic.save(token_critic_path)
-        
-        # Save v_high critic if provided
-        if v_high_critic is not None:
-            v_high_critic_path = os.path.join(checkpoint_dir, "v_high_critic")
-            v_high_critic.save(v_high_critic_path)
         
         # Save high-level policy if provided
         if high_level_policy is not None:
@@ -4111,6 +4246,10 @@ class AgentTrainer:
         # Combine scores with annealed weights
         combined_scores = v_high_weight * normalized_v_high + perplexity_weight * normalized_perplexity
         
+        # MEMORY CLEANUP: Delete intermediate tensors to prevent accumulation
+        del v_high_scores, perplexity_scores, v_high_mean, v_high_std
+        del perplexity_mean, perplexity_std, normalized_v_high, normalized_perplexity
+        
         return combined_scores
 
 # ------------------------------------------------------------------
@@ -4209,32 +4348,7 @@ def load_templates(templates_path: str = "src/configs/templates.json") -> List[D
 
 
 def _get_default_templates() -> List[Dict[str, Any]]:
-    """
-    Get default templates if file loading fails.
-    
-    Returns:
-        List of default template dictionaries
-    """
-    return [
-        {
-            "id": "standard_inquiry",
-            "template": "I'm curious about {topic}. Can you explain how to {question}?",
-            "type": "standard",
-            "instruction": "Standard inquiry template with curiosity framing"
-        },
-        {
-            "id": "technical_research",
-            "template": "For research purposes only: {question} regarding {topic}?",
-            "type": "technical",
-            "instruction": "Technical research framing for detailed information"
-        },
-        {
-            "id": "hypothetical_scenario",
-            "template": "What would happen if someone wanted to {question} with respect to {topic}?",
-            "type": "hypothetical",
-            "instruction": "Hypothetical framing to explore potential scenarios"
-        }
-    ]
+    raise ValueError("Templates file not found")
 
 def extract_topic_from_state(
     state: Union[str, List[str]], 

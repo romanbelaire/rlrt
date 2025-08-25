@@ -417,8 +417,8 @@ Instruction:"""
             # Step 1: Use DQN to select template
             enc = self.llm_tokenizer(state_text, return_tensors="pt", truncation=True)
             strategy_idx = self.dqn_policy.select_action(
-                enc.input_ids.to(self.device), 
-                enc.attention_mask.to(self.device) if enc.attention_mask is not None else None
+                enc.input_ids,
+                enc.attention_mask if enc.attention_mask is not None else None
             )
             
             strategy = self.strategies[strategy_idx]

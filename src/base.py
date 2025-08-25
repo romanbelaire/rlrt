@@ -865,7 +865,7 @@ class BaseModelSingleton:
     _instances = {}
     
     @classmethod
-    def get_instance(cls, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, ds_config=None, prefer_gpu=None, quantize=None):
+    def get_instance(cls, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, ds_config=None, prefer_gpu=None, quantize=None, instance_tag: str = None):
         """
         Get or create a singleton instance for the given model.
         
@@ -878,12 +878,14 @@ class BaseModelSingleton:
             ds_config: DeepSpeed configuration
             prefer_gpu: Preferred GPU index (0, 1, etc.) or None for auto placement
             quantize: Quantization setting (False, 4, or 8) - overrides training mixed_precision
+            instance_tag: Optional tag to distinguish instances sharing the same model_name (e.g., 'agent', 'critic')
             
         Returns:
             BaseModelSingleton instance
         """
-        if model_name not in cls._instances:
-            cls._instances[model_name] = cls(
+        key = (model_name, instance_tag)
+        if key not in cls._instances:
+            cls._instances[key] = cls(
                 model_name=model_name,
                 hf_token=hf_token,
                 use_offloading=use_offloading,
@@ -893,7 +895,7 @@ class BaseModelSingleton:
                 prefer_gpu=prefer_gpu,
                 quantize=quantize
             )
-        return cls._instances[model_name]
+        return cls._instances[key]
     
     def _get_device_map_strategy(self):
         """
@@ -906,6 +908,13 @@ class BaseModelSingleton:
         """
         if self.use_offloading:
             return None  # CPU offloading mode
+        
+        # Respect config flag: only enable device_map when explicitly requested
+        cfg_enable = False
+        if self.config is not None and hasattr(self.config, "model"):
+            cfg_enable = bool(getattr(self.config.model, "enable_device_map", False))
+        if not cfg_enable:
+            return None
         
         if not torch.cuda.is_available():
             return "cpu"
@@ -1025,11 +1034,17 @@ class BaseModelSingleton:
         model_kwargs = {
             'token': self.hf_token,
             'torch_dtype': torch_dtype,
-            'device_map': device_map,
-            'max_memory': max_memory,
             'low_cpu_mem_usage': True,
             'trust_remote_code': True
         }
+        if device_map is not None:
+            model_kwargs['device_map'] = device_map
+            # Build max_memory map if specified in config
+            if max_memory is not None:
+                model_kwargs['max_memory'] = max_memory
+        else:
+            # No device_map: fall back to single-device placement later
+            pass
         
         # Add quantization config if specified
         if self.quantize == 4:
@@ -1052,6 +1067,14 @@ class BaseModelSingleton:
         # Ensure model is in bf16 for consistency (but skip if using bitsandbytes quantization)
         if torch_dtype == torch.bfloat16 and self.quantize not in [4, 8]:
             self.base_model = self.base_model.to(dtype=torch.bfloat16)
+        
+        # If device_map is disabled, move entire model to a single compute device
+        if device_map is None:
+            if torch.cuda.is_available():
+                target_device = "cuda:0"
+            else:
+                target_device = "cpu"
+            self.base_model.to(target_device)
         
         # Log device placement information
         if hasattr(self.base_model, 'hf_device_map'):

@@ -49,16 +49,22 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         """
         super().__init__()
         
-        self.encoder = encoder
-        self.tokenizer = tokenizer
-        
         # Load templates from file
         self.strategies = self._load_strategies(templates_path)
         self.num_actions = len(self.strategies)
         
         # Device setup
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
+        # Prefer the encoder's intended embedding device to avoid mismatches with Accelerate/device_map
+        if encoder is None:
+            raise RuntimeError("Encoder must be provided for PPOTemplateHighLevelPolicy")
+        # Resolve the true target device for the embedding shard even before first forward()
+        self.encoder_device = self._resolve_embedding_target_device(encoder)
+        # Respect explicit device override only if the encoder is not sharded by Accelerate
+        if hasattr(encoder, 'hf_device_map') and getattr(encoder, 'hf_device_map'):
+            # When sharded, always pin to the embedding shard device to avoid mismatches
+            self.device = self.encoder_device
+        else:
+            self.device = torch.device(device) if device is not None else self.encoder_device
         
         # Classification head for template selection
         self.template_classifier = nn.Sequential(
@@ -69,10 +75,69 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         )
         
         # Ensure classifier uses the same dtype as encoder
-        encoder_dtype = next(self.encoder.parameters()).dtype
-        self.template_classifier = self.template_classifier.to(dtype=encoder_dtype)
+        if encoder is not None:
+            encoder_dtype = next(encoder.parameters()).dtype
+            # Place classifier on chosen device and match dtype to encoder
+            self.template_classifier = self.template_classifier.to(device=self.device, dtype=encoder_dtype)
+        
+        # Move only the template_classifier to device (already done above)
+        
+        # Store encoder and tokenizer AFTER all device operations
+        # This prevents them from being affected by to() calls
+        self.encoder = encoder
+        self.tokenizer = tokenizer
+        
+        # Verify encoder and tokenizer are properly stored
+        if self.encoder is None:
+            raise RuntimeError("Encoder became None during PPOTemplateHighLevelPolicy initialization")
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer became None during PPOTemplateHighLevelPolicy initialization")
         
         print(f"Initialized PPO template selector with {self.num_actions} templates")
+    
+    def _resolve_embedding_target_device(self, encoder: nn.Module) -> torch.device:
+        """
+        Resolve the target device for the encoder's input embeddings.
+        Uses hf_device_map when present to avoid lazy-loading reporting CPU.
+        """
+        # Prefer explicit hf_device_map when available
+        if hasattr(encoder, 'hf_device_map') and getattr(encoder, 'hf_device_map'):
+            device_map = encoder.hf_device_map
+            key_candidates = [
+                'model.embed_tokens',  # Llama style
+                'model.wte',           # GPT style
+                'transformer.wte',     # Alternative GPT style
+            ]
+            target = None
+            for k in key_candidates:
+                if k in device_map:
+                    target = device_map[k]
+                    break
+            if target is None:
+                # Fallback: use the first value from the map
+                target = next(iter(device_map.values()))
+            # Normalize target to torch.device
+            if isinstance(target, str):
+                # Common formats: 'cuda:0', 'cpu', or integer as string
+                try:
+                    if target.startswith('cuda') or target == 'cpu':
+                        return torch.device(target)
+                    # Try integer string
+                    gpu_idx = int(target)
+                    return torch.device(f'cuda:{gpu_idx}')
+                except Exception:
+                    pass
+            elif isinstance(target, int):
+                return torch.device(f'cuda:{target}')
+            # Last resort: fall back to any parameter device
+            try:
+                return next(encoder.parameters()).device
+            except StopIteration:
+                return torch.device('cpu')
+        # No map: use current embedding weight device or any parameter device
+        if hasattr(encoder, 'get_input_embeddings') and encoder.get_input_embeddings() is not None:
+            return encoder.get_input_embeddings().weight.device
+        return next(encoder.parameters()).device
     
     def _load_strategies(self, templates_path: str) -> List[Dict[str, Any]]:
         """
@@ -115,6 +180,14 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         Returns:
             Pooled representation [batch_size, hidden_size]
         """
+        # Ensure inputs are on the encoder's embedding device with correct dtypes
+        target_device = self._resolve_embedding_target_device(self.encoder)
+        if input_ids.device != target_device:
+            input_ids = input_ids.to(target_device)
+        if input_ids.dtype != torch.long:
+            input_ids = input_ids.long()
+        if attention_mask is not None and attention_mask.device != target_device:
+            attention_mask = attention_mask.to(target_device)
         with torch.no_grad():
             outputs = self.encoder(
                 input_ids=input_ids,
@@ -159,7 +232,22 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         Returns:
             Template logits [batch_size, num_templates]
         """
+        # Fail-fast: verify placement before forward
+        model_device_check = self._resolve_embedding_target_device(self.encoder)
+        if input_ids.device != model_device_check:
+            # Move and assert again – callers should be passing CPU tensors; we handle placement.
+            input_ids = input_ids.to(model_device_check)
+        # Also ensure attention_mask follows the encoder device if provided
+        if attention_mask is not None and attention_mask.device != model_device_check:
+            attention_mask = attention_mask.to(model_device_check)
+        # Final sanity check
+        if input_ids.device != model_device_check or (attention_mask is not None and attention_mask.device != model_device_check):
+            raise RuntimeError(f"High-level policy device mismatch: input_ids on {input_ids.device}, attention_mask on {attention_mask.device if attention_mask is not None else 'None'}, encoder on {model_device_check}")
         pooled = self._encode_state(input_ids, attention_mask)
+        # Ensure pooled representation is on the classifier's device
+        head_device = next(self.template_classifier.parameters()).device
+        if pooled.device != head_device:
+            pooled = pooled.to(head_device)
         return self.template_classifier(pooled)
     
     def select_action(
@@ -179,7 +267,7 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         Returns:
             Selected template index
         """
-        logits = self.forward(input_ids.to(self.device), attention_mask.to(self.device) if attention_mask is not None else None)
+        logits = self.forward(input_ids, attention_mask if attention_mask is not None else None)
         
         if force_greedy:
             # Use argmax for evaluation
@@ -201,8 +289,8 @@ class PPOTemplateHighLevelPolicy(nn.Module):
             - Log probabilities [batch_size]
             - Entropy [batch_size]
         """
-        # Ensure tensors are on the correct device
-        encoder_device = next(self.encoder.parameters()).device
+        # Ensure tensors are on the encoder's embedding device
+        encoder_device = self.encoder.get_input_embeddings().weight.device if hasattr(self.encoder, "get_input_embeddings") else next(self.encoder.parameters()).device
         state = state.to(encoder_device)
         
         # Get logits for all templates
@@ -253,8 +341,9 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         for i, state_text in enumerate(state_texts):
             # Tokenize state
             enc = self.tokenizer(state_text, return_tensors="pt", truncation=True)
-            input_ids = enc.input_ids.to(self.device)
-            attention_mask = enc.attention_mask.to(self.device) if enc.attention_mask is not None else None
+            # Keep tokenized tensors on CPU; model will move to correct devices
+            input_ids = enc.input_ids
+            attention_mask = enc.attention_mask if enc.attention_mask is not None else None
             
             # Select template
             template_idx = self.select_action(input_ids, attention_mask)
@@ -281,7 +370,7 @@ class PPOTemplateHighLevelPolicy(nn.Module):
                 log_probs_list.append(selected_log_prob)
         
         # Stack log probabilities
-        log_probs_tensor = torch.stack(log_probs_list) if log_probs_list else torch.zeros(batch_size, device=self.device)
+        log_probs_tensor = torch.stack(log_probs_list) if log_probs_list else torch.zeros(batch_size, device=next(self.template_classifier.parameters()).device)
         
         return instructions, log_probs_tensor, template_indices
     
@@ -314,9 +403,9 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         
         print(f"Saved PPO template policy to {path}")
     
-    def load(self, path: str, device: Optional[str] = None) -> None:
+    def load_weights(self, path: str, device: Optional[str] = None) -> None:
         """
-        Load the PPO template policy from a directory.
+        Load the PPO template policy weights from a directory.
         
         Args:
             path: Directory path to load the policy from
@@ -354,6 +443,7 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         Returns:
             Loaded PPOTemplateHighLevelPolicy instance
         """
+        
         if encoder is None:
             raise ValueError("Encoder is required to load PPOTemplateHighLevelPolicy")
         if tokenizer is None:
@@ -383,6 +473,6 @@ class PPOTemplateHighLevelPolicy(nn.Module):
         )
         
         # Load the actual weights
-        policy.load(path, device)
+        policy.load_weights(path, device)
         
         return policy 

@@ -143,6 +143,7 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
                 attention_mask: torch.Tensor,
                 return_attention: bool = False,
                 requires_grad: bool = False,
+                return_last_hidden: bool = False,
                 **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Compute value estimates for given inputs.
@@ -152,25 +153,21 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
             attention_mask: Attention mask
             return_attention: Whether to return attention weights
             requires_grad: Whether to calculate gradients
+            return_last_hidden: Whether to also return the last hidden states tensor
             **kwargs: Additional arguments
             
         Returns:
             Value estimates (and optionally attention weights)
         """
-        # Determine compute device
-        compute_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        base_device = next(self.model.parameters()).device
+        # Determine target device: use model's input embedding device (first shard)
+        model_device = self.model.get_input_embeddings().weight.device
         
-        # Move input tensors to the compute device
-        input_ids = input_ids.to(compute_device)
-        attention_mask = attention_mask.to(compute_device)
+        # Move inputs to the shard device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
         
-        # Move model to compute device if needed
-        if base_device != compute_device:
-            self.model.to(compute_device)
-            
-        # Move value head to compute device
-        self.value_head.to(compute_device)
+        # Ensure value head is on same device as hidden states
+        self.value_head.to(model_device)
         
         # Forward pass through the model with gradient control
         with torch.set_grad_enabled(requires_grad):
@@ -218,7 +215,7 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
                 **kwargs
             )
             
-            # Get the hidden states from the last layer
+            # Get the last hidden states (consistent with policies.py usage)
             hidden_states = outputs.hidden_states[-1]
             
             # ------------------------------------------------------------------
@@ -242,12 +239,18 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
             
             # Get attention weights if requested
             attentions = outputs.attentions if return_attention else None
+            
+            # Optionally also return the last hidden states for downstream heuristics
+            last_hidden = hidden_states if return_last_hidden else None
         
         # Return appropriate results based on flags
+        if return_attention and return_last_hidden:
+            return values, attentions, last_hidden
         if return_attention:
             return values, attentions
-        else:
-            return values
+        if return_last_hidden:
+            return values, last_hidden
+        return values
             
     def cleanup_gpu_memory(self) -> None:
         """Explicitly clear GPU memory."""
@@ -334,8 +337,9 @@ class SequenceLevelValueCritic(AbstractValueCritic):
         
         value_head_path = os.path.join(load_path, "sequence_value_head.pt")
         if not os.path.exists(value_head_path):
-            warnings.warn(f"Sequence value head not found at {value_head_path}. Initializing from scratch.")
-            return
+            raise FileNotFoundError(
+                f"Sequence value head not found at {value_head_path}. This checkpoint is incomplete and cannot be used."
+            )
             
         state_dict = torch.load(value_head_path)
         success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
@@ -423,8 +427,9 @@ class TokenLevelValueCritic(AbstractValueCritic):
         
         value_head_path = os.path.join(load_path, "token_value_head.pt")
         if not os.path.exists(value_head_path):
-            warnings.warn(f"Token value head not found at {value_head_path}. Initializing from scratch.")
-            return
+            raise FileNotFoundError(
+                f"Token value head not found at {value_head_path}. This checkpoint is incomplete and cannot be used."
+            )
             
         state_dict = torch.load(value_head_path)
         success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
@@ -432,3 +437,206 @@ class TokenLevelValueCritic(AbstractValueCritic):
             raise RuntimeError(error)
             
         print(f"Loaded token-level value head from {load_path}")
+
+
+class TokenLevelValueCriticV(AbstractValueCritic):
+    """
+    Low-level V function for token-level value estimation in single-agent archer.
+    
+    Takes state tokens (not state+action) and predicts a scalar value representing
+    the expected value the policy can obtain from a sequence of tokens.
+    This approximates V_low(state) for the expected value of the current state.
+    
+    Key difference from TokenLevelValueCritic: This is a V function, not Q function.
+    """
+    
+    def _init_value_head(self) -> None:
+        """Initialize token-level V function head with layer normalization."""
+        hidden_size = self.model.config.hidden_size
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # Initialize weights
+        for module in self.value_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    @property
+    def is_token_level(self) -> bool:
+        """This is a token-level V function critic."""
+        return True
+    
+    def _compute_values(self, 
+                       hidden_states: torch.Tensor, 
+                       attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-token V values for expected value at each token position.
+        
+        Args:
+            hidden_states: Hidden states from transformer [batch, seq_len, hidden_size]
+            attention_mask: Attention mask [batch, seq_len]
+            
+        Returns:
+            Per-token V values [batch, seq_len]
+        """
+        # Apply value head to each token position
+        values = self.value_head(hidden_states).squeeze(-1)  # [batch, seq_len]
+        
+        # Mask out pad tokens
+        values = values * attention_mask.float()
+        
+        # Ensure consistent dtype with model
+        model_dtype = next(self.model.parameters()).dtype
+        values = values.to(dtype=model_dtype)
+        
+        return values
+    
+    def forward(self, 
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                return_attention: bool = False,
+                requires_grad: bool = False,
+                return_last_hidden: bool = False,
+                **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Compute V function estimates for given state inputs (no action concatenation).
+        
+        Args:
+            input_ids: Input token ids (state only, not state + action)
+            attention_mask: Attention mask
+            return_attention: Whether to return attention weights
+            requires_grad: Whether to calculate gradients
+            return_last_hidden: Whether to also return the last hidden states tensor
+            **kwargs: Additional arguments
+            
+        Returns:
+            V function estimates (and optionally attention weights)
+        """
+        # Determine target device: use model's input embedding device (first shard)
+        model_device = self.model.get_input_embeddings().weight.device
+        
+        # Move inputs to the shard device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
+        
+        # Ensure value head is on same device as hidden states
+        self.value_head.to(model_device)
+        
+        # Forward pass through the model with gradient control
+        with torch.set_grad_enabled(requires_grad):
+            # MEMORY OPTIMIZATION: Create a custom forward pass that avoids loading the language model head
+            def custom_forward(*args, **kwargs):
+                # Remove any logits-related arguments to prevent LM head computation
+                kwargs.pop('labels', None)
+                kwargs.pop('lm_labels', None)
+                
+                # Call the model's forward method but stop at hidden states
+                if hasattr(self.model, 'model'):
+                    # For models with a 'model' attribute (like LlamaForCausalLM)
+                    transformer_outputs = self.model.model(
+                        *args,
+                        **kwargs
+                    )
+                else:
+                    # For models without a 'model' attribute, try to access layers directly
+                    transformer_outputs = self.model(
+                        *args,
+                        **kwargs
+                    )
+                
+                return transformer_outputs
+            
+            # Get model outputs with activation clamping
+            outputs = apply_activation_clamping(
+                self.model,
+                custom_forward,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_attentions=return_attention,
+                return_dict=True,
+                enable_hooks=self.enable_forward_hooks,
+                clamp_range=self.forward_hook_clamp_range,
+                layernorm_range=self.forward_hook_layernorm_range,
+                # Memory-saving flags --------------------------------------------------
+                use_cache=False,                    # (b) explicitly disable KV cache
+                attn_implementation="flash_attention_2",  # (d) flash-attention
+                # ---------------------------------------------------------------------
+                **kwargs
+            )
+            
+            # Get the last hidden states (consistent with policies.py usage)
+            hidden_states = outputs.hidden_states[-1]
+            
+            # ------------------------------------------------------------------
+            # MEMORY OPTIMISATION: the transformer backbone is *frozen* so we do
+            # **not** require gradients w.r.t. its parameters.  However, leaving
+            # the graph intact would force PyTorch to keep a full history of all
+            # intermediate activations for *every* transformer layer – easily
+            # tens of gigabytes for an 8-b model.
+            #
+            # We therefore detach the hidden states from the graph, freeing the
+            # backbone activations immediately, and (optionally) mark the
+            # detached tensor as requiring grad so that the small value-head can
+            # still be updated.
+            # ------------------------------------------------------------------
+            hidden_states = hidden_states.detach()
+            if requires_grad:
+                hidden_states.requires_grad_(True)
+            
+            # Compute V values using subclass-specific logic
+            values = self._compute_values(hidden_states, attention_mask)
+            
+            # Get attention weights if requested
+            attentions = outputs.attentions if return_attention else None
+            
+            # Optionally also return the last hidden states for downstream heuristics
+            last_hidden = hidden_states if return_last_hidden else None
+        
+        # Return appropriate results based on flags
+        if return_attention and return_last_hidden:
+            return values, attentions, last_hidden
+        if return_attention:
+            return values, attentions
+        if return_last_hidden:
+            return values, last_hidden
+        return values
+    
+    def save(self, save_path: str) -> None:
+        """
+        Save the V function critic model.
+        
+        Args:
+            save_path: Path to save the model to
+        """
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(self.value_head.state_dict(), os.path.join(save_path, "token_v_function_head.pt"))
+        print(f"Saved token-level V function head to {save_path}")
+        
+    def load(self, load_path: str) -> None:
+        """
+        Load the V function critic model.
+        
+        Args:
+            load_path: Path to load the model from
+        """
+        from src.utils import safe_load_state_dict
+        
+        value_head_path = os.path.join(load_path, "token_v_function_head.pt")
+        if not os.path.exists(value_head_path):
+            raise FileNotFoundError(
+                f"Token V function head not found at {value_head_path}. This checkpoint is incomplete and cannot be used."
+            )
+            
+        state_dict = torch.load(value_head_path)
+        success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
+        if not success:
+            raise RuntimeError(error)
+            
+        print(f"Loaded token-level V function head from {load_path}")

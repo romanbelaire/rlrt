@@ -76,7 +76,16 @@ class TemplateHighLevelPolicy(nn.Module):
             nn.Linear(actual_hidden_size, self.num_actions),
         )
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Prefer the encoder's embedding device to avoid mismatches when using Accelerate/device_map
+        if hasattr(encoder, "get_input_embeddings") and encoder.get_input_embeddings() is not None:
+            self.encoder_device = encoder.get_input_embeddings().weight.device
+        else:
+            self.encoder_device = next(encoder.parameters()).device
+        # Respect explicit device override only if encoder is not sharded by Accelerate
+        if hasattr(encoder, 'hf_device_map') and getattr(encoder, 'hf_device_map'):
+            self.device = self.encoder_device
+        else:
+            self.device = torch.device(device) if device is not None else self.encoder_device
         self.to(self.device)
         
         # Ensure Q-head is in bf16 for consistency
@@ -136,6 +145,14 @@ class TemplateHighLevelPolicy(nn.Module):
 
     def _encode_state(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return a pooled representation (last token) from the encoder."""
+        # Ensure tensors are on the encoder's embedding device and correct dtype
+        target_device = self.encoder.get_input_embeddings().weight.device if hasattr(self.encoder, "get_input_embeddings") else next(self.encoder.parameters()).device
+        if input_ids.device != target_device:
+            input_ids = input_ids.to(target_device)
+        if input_ids.dtype != torch.long:
+            input_ids = input_ids.long()
+        if attention_mask is not None and attention_mask.device != target_device:
+            attention_mask = attention_mask.to(target_device)
         with torch.no_grad():
             # Force the model to return hidden states instead of logits
             outputs = self.encoder(
@@ -176,7 +193,15 @@ class TemplateHighLevelPolicy(nn.Module):
     # ------------------------------------------------------------------ API
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute Q-values for every template in the registry."""
+        # Fail-fast: ensure inputs match the encoder embedding device
+        model_device_check = self.encoder.get_input_embeddings().weight.device if hasattr(self.encoder, "get_input_embeddings") else next(self.encoder.parameters()).device
+        if input_ids.device != model_device_check:
+            input_ids = input_ids.to(model_device_check)
         pooled = self._encode_state(input_ids, attention_mask)
+        # Ensure pooled representation is on the Q-head device
+        head_device = next(self.q_head.parameters()).device
+        if pooled.device != head_device:
+            pooled = pooled.to(head_device)
         return self.q_head(pooled)
 
     @torch.no_grad()
@@ -188,7 +213,7 @@ class TemplateHighLevelPolicy(nn.Module):
         epsilon = 0.0 if force_greedy else self._current_epsilon()
         if random.random() < epsilon:
             return random.randrange(self.num_actions)
-        q_values = self.forward(input_ids.to(self.device), attention_mask.to(self.device) if attention_mask is not None else None)
+        q_values = self.forward(input_ids, attention_mask if attention_mask is not None else None)
         return int(torch.argmax(q_values, dim=-1).item())
 
     # ------------------------------------------------------------------ DQN update
@@ -205,10 +230,10 @@ class TemplateHighLevelPolicy(nn.Module):
         states_enc = self.tokenizer(list(state_texts), return_tensors="pt", padding=True, truncation=True)
         next_states_enc = self.tokenizer(list(next_state_texts), return_tensors="pt", padding=True, truncation=True)
 
-        input_ids = states_enc.input_ids.to(self.device)
-        attention_mask = states_enc.attention_mask.to(self.device)
-        next_input_ids = next_states_enc.input_ids.to(self.device)
-        next_attention_mask = next_states_enc.attention_mask.to(self.device)
+        input_ids = states_enc.input_ids
+        attention_mask = states_enc.attention_mask
+        next_input_ids = next_states_enc.input_ids
+        next_attention_mask = next_states_enc.attention_mask
 
         action_tensor = torch.tensor(actions, dtype=torch.long, device=self.device)
         reward_tensor = torch.tensor(rewards, dtype=torch.bfloat16, device=self.device)
