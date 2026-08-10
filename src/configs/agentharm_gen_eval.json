@@ -1,0 +1,36 @@
+{
+  "agent_name": "agentharm-gen-red-team-eval",
+  "device": "cuda:0",
+  "critic_device": "cuda:0",
+  "training": {
+    "episodes": 1,
+    "rollout_steps": 4,
+    "debug_mode": true,
+    "output_dir": "outputs/agentharm-gen-red-team-eval",
+    "use_freeform_high_level": true
+  },
+  "model": {
+    "hf_checkpoint": "HuggingFaceH4/zephyr-7b-beta",
+    "use_high_level_policy": true,
+    "use_tool_index_policy": true,
+    "tool_registry_path": "src/agentharm_gen/generated/tool_registry.json",
+    "high_level_policy_type": "freeform",
+    "use_lora": false,
+    "quantize": false
+  },
+  "environment": {
+    "env_task": "agentharm_gen",
+    "evaluation_mode": true,
+    "max_steps": 4,
+    "max_new_tokens": 512,
+    "batch_size": 1,
+    "target_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "guard_model": null,
+    "lmrl_options": {
+      "tasks_path": "src/agentharm_gen/generated/tasks.jsonl",
+      "n_irrelevant_tools": 0,
+      "max_defender_tool_rounds": 5,
+      "defender_temperature": 0.0
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "system_prompt": "You are playing 20 Questions with a user. Your goal is to guess what word they are thinking of by asking strategic yes/no questions. You have a maximum of 20 questions. Ask questions that eliminate many possibilities at once, starting with broad categories and then narrowing down. Use the conversation history to inform your next question.",
+  "templates": [
+    {
+      "id": "twentyq_context",
+      "instruction": "We know this information about the word: {context}. What unknown information is needed to narrow down the word?"
+    },
+    {
+      "id": "twentyq_context_and_probe",
+      "instruction": "We know this information about the word: {context}. We have established that the following information is not true: {probe}. What information can we infer from this?"
+    },
+    {
+      "id": "twentyq_default_simple",
+      "instruction": "We have previously established the following context: {context}. Ask a concise yes/no question that reveals the most useful information about the word."
+    },
+    {
+      "id": "twentyq_default_probe",
+      "instruction": "We know this information about the word: {context}. Ask a concise yes/no question that most effectively bisects the hypothesis space."
+    },
+    {
+      "id": "twentyq_category_then_refine",
+      "instruction": "We have previously established the following context: {context}. First identify broad category (e.g., living/non-living, size, material), then refine with properties and typical contexts."
+    },
+    {
+      "id": "twentyq_property_elimination",
+      "instruction": "We have previously established the following context: {context}. Systematically eliminate properties (shape, color, size, use, location). Prefer questions that eliminate ~50% of remaining possibilities."
+    }
+  ]
+} 

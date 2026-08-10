@@ -31,19 +31,26 @@ class OpenAITargetModel:
         temperature: float = 0.7,
         debug_mode: bool = False,
         batch_size: int = 16,
-        max_concurrent_requests: int = 10
+        max_concurrent_requests: int = 10,
+        reasoning_effort: Optional[str] = None,
     ):
         """
         Initialize OpenAI target model.
         
         Args:
-            model_name: OpenAI model to use (e.g., "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo")
+            model_name: OpenAI model to use (e.g., "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo",
+                "gpt-5.4", "gpt-5.4-mini")
             api_key: OpenAI API key (if None, reads from OPENAI_API_KEY env var)
             max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
+            temperature: Sampling temperature (ignored for reasoning models)
             debug_mode: Whether to enable debug logging
             batch_size: Batch size for API calls
             max_concurrent_requests: Maximum number of concurrent synchronous requests
+            reasoning_effort: If non-None, treat this model as an OpenAI reasoning model
+                and pass `reasoning_effort=<value>` to the Chat Completions API.
+                Accepted values mirror the OpenAI API ("none", "minimal", "low",
+                "medium", "high"). When set, `max_completion_tokens` is used in place
+                of `max_tokens` and unsupported sampling params are omitted.
         """
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -51,6 +58,8 @@ class OpenAITargetModel:
         self.debug_mode = debug_mode
         self.batch_size = batch_size
         self.max_concurrent_requests = max_concurrent_requests
+        self.reasoning_effort = reasoning_effort
+        self.is_reasoning_model = reasoning_effort is not None
         
         # Initialize OpenAI client
         api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -85,6 +94,8 @@ class OpenAITargetModel:
             print(f"OpenAI Target Model initialized: {model_name}")
             print(f"Max tokens: {max_new_tokens}, Temperature: {temperature}")
             print(f"Concurrent requests: {max_concurrent_requests}")
+            if self.is_reasoning_model:
+                print(f"Reasoning mode enabled: reasoning_effort={reasoning_effort}")
     
     def _init_perplexity_model(self):
         """Initialize a frozen Llama model for perplexity computations."""
@@ -100,7 +111,8 @@ class OpenAITargetModel:
                 print(f"Multi-GPU setup detected: targeting PERPLEXITY model for GPU {perplexity_prefer_gpu} (inference GPU)")
             
             # Load tokenizer
-            self.perplexity_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+            self.perplexity_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", padding_side='left')
+            self.perplexity_tokenizer.padding_side = 'left'
             if self.perplexity_tokenizer.pad_token is None:
                 self.perplexity_tokenizer.pad_token = self.perplexity_tokenizer.eos_token
             
@@ -184,33 +196,36 @@ class OpenAITargetModel:
                 
                 logits = outputs.logits
                 
-                # Compute perplexity for each sequence
-                perplexities = []
-                for i in range(len(texts)):
-                    # Get valid tokens (exclude padding)
-                    valid_mask = attention_mask[i] == 1
-                    if valid_mask.sum() <= 1:  # Need at least 2 tokens for perplexity
-                        perplexities.append(1.0)
-                        continue
-                    
-                    # Get logits for valid positions (excluding the last token as target)
-                    valid_logits = logits[i, :-1][valid_mask[:-1]]
-                    valid_targets = input_ids[i, 1:][valid_mask[:-1]]
-                    
-                    if len(valid_targets) == 0:
-                        perplexities.append(1.0)
-                        continue
-                    
-                    # Compute log probabilities
-                    log_probs = torch.log_softmax(valid_logits, dim=-1)
-                    target_log_probs = log_probs.gather(-1, valid_targets.unsqueeze(-1)).squeeze(-1)
-                    
-                    # Compute perplexity: exp(-mean(log_prob))
-                    mean_log_prob = target_log_probs.mean()
-                    perplexity = torch.exp(-mean_log_prob)
-                    perplexities.append(perplexity.item())
+                # Vectorized perplexity computation for all sequences at once
+                # Shift logits and targets: logits[i] predicts input_ids[i+1]
+                # Exclude last position (no target for it)
+                shifted_logits = logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
+                shifted_targets = input_ids[:, 1:]  # [batch, seq_len-1]
+                shifted_attention = attention_mask[:, 1:]  # [batch, seq_len-1]
                 
-                return torch.tensor(perplexities, device="cpu")
+                # Compute log probabilities for all positions at once
+                log_probs = torch.log_softmax(shifted_logits, dim=-1)  # [batch, seq_len-1, vocab_size]
+                
+                # Gather log probs for target tokens: [batch, seq_len-1]
+                target_log_probs = log_probs.gather(-1, shifted_targets.unsqueeze(-1)).squeeze(-1)
+                
+                # Mask out padding positions
+                target_log_probs = target_log_probs * shifted_attention.float()
+                
+                # Compute mean log prob per sequence (only over valid tokens)
+                valid_token_counts = shifted_attention.sum(dim=1, keepdim=True)  # [batch, 1]
+                # Avoid division by zero
+                valid_token_counts = torch.clamp(valid_token_counts, min=1.0)
+                mean_log_probs = target_log_probs.sum(dim=1) / valid_token_counts.squeeze(1)  # [batch]
+                
+                # Compute perplexity: exp(-mean(log_prob))
+                perplexities = torch.exp(-mean_log_probs)
+                
+                # Handle edge cases: sequences with <= 1 valid token get perplexity 1.0
+                valid_mask = (valid_token_counts.squeeze(1) > 1.0)
+                perplexities = torch.where(valid_mask, perplexities, torch.ones_like(perplexities))
+                
+                return perplexities.cpu()
                 
         except Exception as e:
             print(f"Error computing perplexity: {e}")
@@ -288,6 +303,31 @@ class OpenAITargetModel:
             # Return neutral log probabilities on error
             return torch.zeros(len(texts), device="cpu")
     
+    def _build_request_kwargs(self, chat: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Build the kwargs for a single Chat Completions request.
+
+        Reasoning models (e.g. gpt-5.4 family) use a different API surface:
+        - `max_completion_tokens` instead of `max_tokens`
+        - `reasoning_effort` parameter
+        - no custom temperature / top_p / frequency_penalty / presence_penalty
+        """
+        if self.is_reasoning_model:
+            return {
+                "model": self.model_name,
+                "messages": chat,
+                "max_completion_tokens": self.max_new_tokens,
+                "reasoning_effort": self.reasoning_effort,
+            }
+        return {
+            "model": self.model_name,
+            "messages": chat,
+            "max_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "top_p": 1.0,
+            "frequency_penalty": 0,
+            "presence_penalty": 0,
+        }
+
     def _rate_limit_check(self):
         """Check and enforce rate limits."""
         current_time = time.time()
@@ -343,13 +383,7 @@ class OpenAITargetModel:
             
             try:
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=chat,
-                    max_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=1.0,
-                    frequency_penalty=0,
-                    presence_penalty=0
+                    **self._build_request_kwargs(chat)
                 )
                 
                 generated_text = response.choices[0].message.content or ""
@@ -391,13 +425,7 @@ class OpenAITargetModel:
                 self._rate_limit_check()
                 
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=chat,
-                    max_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=1.0,
-                    frequency_penalty=0,
-                    presence_penalty=0
+                    **self._build_request_kwargs(chat)
                 )
                 
                 generated_text = response.choices[0].message.content or ""
@@ -533,12 +561,13 @@ def create_openai_target_model(config: Any) -> tuple[OpenAITargetModel, OpenAITa
     Returns:
         Tuple of (model, tokenizer)
     """
-    # Extract parameters from environment instance
-    model_name = getattr(config, 'target_model_name', 'gpt-4o-mini')
-    max_new_tokens = getattr(config, 'max_new_tokens', 100)
-    debug_mode = getattr(config, 'debug_mode', False)
-    batch_size = getattr(config, 'batch_size', 16)
-    
+    # Extract parameters from environment instance (attributes set in Environment.__init__)
+    model_name = config.target_model_name
+    max_new_tokens = config.max_new_tokens
+    debug_mode = config.debug_mode
+    batch_size = config.batch_size
+    reasoning_effort = config.target_reasoning_effort
+
     # Create model and tokenizer
     model = OpenAITargetModel(
         model_name=model_name,
@@ -546,7 +575,8 @@ def create_openai_target_model(config: Any) -> tuple[OpenAITargetModel, OpenAITa
         temperature=0.7,
         debug_mode=debug_mode,
         batch_size=batch_size,
-        max_concurrent_requests=10
+        max_concurrent_requests=10,
+        reasoning_effort=reasoning_effort,
     )
     
     tokenizer = OpenAITargetTokenizer(model_name=model_name)

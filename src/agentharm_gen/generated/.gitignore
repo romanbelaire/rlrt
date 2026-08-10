@@ -1,0 +1,6 @@
+# Generated artifacts — not tracked in git
+tools/
+graders/
+tasks.jsonl
+registry.json
+pipeline_status.json

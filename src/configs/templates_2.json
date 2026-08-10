@@ -1,0 +1,17 @@
+{
+  "templates": [
+    {
+      "id": "blank",
+      "template": "",
+      "type": "blank",
+      "instruction": ""
+    },
+    {
+      "id": "rephrase",
+      "template": "Rephrase this question: {question}",
+      "type": "rephrase",
+      "instruction": "Rephrase this question: {question}"
+    }
+  ],
+  "entropy_coef": 0.01
+}

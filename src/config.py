@@ -34,7 +34,9 @@ class TrainingConfig:
     # Loss coefficients
     entropy_coef: float = 0.01
     kl_coef: float = 0.01
-    perplexity_coef: float = 0.1
+    base_model_kl_coef: float = 0.1  # KL divergence from frozen base model
+    base_model_kl_topk: int = 10  # Top-k tokens from base model for KL divergence (safer, prevents off-manifold deviations)
+    perplexity_coef: float = 0.2
     
     # Randomization
     seed: Optional[int] = None
@@ -70,7 +72,6 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     offload_optimizer_to_cpu: bool = False
     offload_param_to_cpu: bool = False
-    # DeepSpeed / optimizer caching
     load_optimizer_states: bool = True  # if True, attempt to restore optimizer states from checkpoint
     num_gpus: int = 1
     local_rank: int = -1
@@ -107,6 +108,21 @@ class TrainingConfig:
     # If true, use R(s') - R(a) formula for critic targets, where R(s') is target response safety
     # and R(a) is agent action safety. If false, use only R(a) (original behavior).
     use_rs_minus_ra_reward: bool = True
+    
+    # Reward scaling coefficient for R(s') - R(a) reward signal
+    # Applied to base reward and bonuses (success/progress bonuses are 0.1 * reward_coef)
+    reward_coef: float = 1.0
+
+    # Asymmetric reward weighting to emphasize R(s') more than R(a)
+    # Reward = (rs_prime_weight * R(s') - ra_weight * R(a)) * reward_coef
+    # Higher rs_prime_weight makes target harmfulness more important
+    # Default (1.0, 1.0) gives standard R(s') - R(a)
+    rs_prime_weight: float = 1.0  # Weight for target response harmfulness R(s')
+    ra_weight: float = 1.0  # Weight for agent action harmfulness R(a)
+    
+    # Bonus scaling coefficients (default 0.1, can be increased to make bonuses more impactful)
+    success_bonus_coef: float = 0.1  # Bonus when R(s') > 0.7
+    progress_bonus_coef: float = 0.1  # Bonus when R(s') > R(s)
 
     # Memory optimization settings
     dynamic_batch_sizing: bool = False
@@ -118,7 +134,6 @@ class TrainingConfig:
     # Actor/critic chunking controls
     actor_chunk_threshold: int = 2048
     
-    # Model swapping for DeepSpeed compatibility
     enable_model_swapping: bool = False
 
     # Critic training chunking settings
@@ -145,11 +160,52 @@ class TrainingConfig:
 
     # HL-only training mode: if True, only train high-level policy and critics (freeze LL agent)
     hl_only_training: bool = False
+    # Freeze high-level policy: use freeform HL for rollout (hierarchical format) but do not train HL (ablation)
+    freeze_high_level: bool = False
+    # Critic-only: train sequence critic heads only (implies freeze LL actor + freeze HL policy)
+    q1_only_training: bool = False
+    # Re-initialize sequence Q/V heads after checkpoint load (fresh critic for γ ablation)
+    reinit_sequence_critic: bool = False
+    # Bellman V_high: V(s) ← r + γ V(s') (1-done). When True, dual-head path trains both Q and V
+    # unless train_v_high_only (q1 / γ ablation) is active.
+    use_bellman_v_high: bool = False
+    # Deprecated alias for use_bellman_v_high
+    use_bellman_q_high: bool = False
+    # Polyak-average tau for sequence-critic target V/Q heads (0 = hard-copy on target_update_freq)
+    critic_target_tau: float = 0.005
+    # Hard-copy interval when tau==0 for sequence critic target heads
+    critic_target_update_freq: int = 1
+    # Running Z-score normalize rewards before TD / GAE / HL advantages
+    normalize_rewards: bool = False
+    reward_norm_clip: float = 10.0
+    reward_norm_momentum: float = 0.99
+    # Online best_model selection via running window of train scores
+    track_best_model: bool = False
+    best_model_window: int = 5
+    best_model_reward_alpha: float = 0.5
+    # Dump adversarial conversations (len > min) during training for critic eval
+    dump_adversarial_trajectories: bool = False
+    adversarial_traj_dump_path: Optional[str] = None
+    adversarial_traj_min_turns: int = 4
+    adversarial_traj_max_count: int = 100
+    adversarial_traj_harm_threshold: float = 0.5
+    # Force-enable the freeform high-level policy regardless of model defaults
+    use_freeform_high_level: bool = False
+    # Chunk size for computing log probabilities in freeform high-level policy (to avoid OOM)
+    freeform_compute_log_probs_chunk_size: int = 2
+    
+    # Archer ablation: coefficient on V_high in (Q_high - coef*V_high - V_low)
+    # Set to 0.0 to drop V_high (i.e., A_high = Q_high - V_low)
+    archer_vhigh_coef: float = 1.0
     
     # Skywork reward model configuration for token-level critic training
     use_skywork_for_token_critic: bool = True  # Whether to use Skywork reward model for token-level critic
     skywork_model_name: str = "Skywork/Skywork-Reward-V2-Llama-3.1-8B"  # Skywork model to use
     skywork_eval_batch_size: int = 4  # Batch size for Skywork reward evaluation (conservative)
+    
+    # Agent generation parameters
+    max_new_tokens: int = 100  # Maximum new tokens for agent generation
+    
 
 
 @dataclass
@@ -178,16 +234,22 @@ class ModelConfig:
     
     # Memory management
     keep_base_on_cpu: bool = False
-    # Enable sharded placement via Transformers/Accelerate device_map
-    enable_device_map: bool = False
     
-    # LoRA configuration
+    # LoRA configuration (for low-level policy)
     use_lora: bool = False
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     target_layers: List[int] = field(default_factory=lambda: list(range(10,24)))
+    
+    # High-level policy LoRA configuration (separate from low-level)
+    high_level_use_lora: Optional[bool] = None  # None means use same as low-level
+    high_level_lora_r: Optional[int] = None  # None means use same as low-level
+    high_level_lora_alpha: Optional[int] = None  # None means use same as low-level
+    high_level_lora_dropout: Optional[float] = None  # None means use same as low-level
+    high_level_target_modules: Optional[List[str]] = None  # None means use same as low-level
+    high_level_target_layers: Optional[List[int]] = None  # None means use same as low-level
     
     # Target model settings
     target_model: Optional[str] = None
@@ -211,9 +273,6 @@ class ModelConfig:
     # agent will ignore learned strategies and always output this string.
     fixed_high_level_instruction: Optional[str] = None
 
-    # DeepSpeed inference configuration path (optional)
-    ds_config_path: Optional[str] = None
-
     # Quantisation level for the agent model backbone (False, 4, or 8)
     quantize: Union[bool, int] = False
     
@@ -221,6 +280,7 @@ class ModelConfig:
     enable_forward_hooks: bool = False  # Whether to attach activation clamping hooks
     forward_hook_clamp_range: float = 30.0  # Clamp range for activation hooks (-range to +range)
     forward_hook_layernorm_range: float = 10.0  # Clamp range for LayerNorm hooks (-range to +range)
+    
     
 
     
@@ -254,6 +314,17 @@ class ModelConfig:
     hybrid_context_framing_enabled: bool = True
     hybrid_complexity_modification_enabled: bool = True
     hybrid_combination_probability: float = 0.7
+
+    # Freeform policy configuration
+    freeform_max_new_tokens: int = 48
+    freeform_temperature: float = 0.8
+    freeform_top_p: float = 0.9
+    freeform_prompt_template: Optional[str] = None  # If None, uses default from freeform_prompts.json
+    freeform_prompts_path: str = "src/configs/freeform_prompts.json"
+    # HL generate-K → critic-select (ASR eval for reward-only / γ critics)
+    hl_critic_selection: bool = False
+    hl_selection_n_candidates: int = 5
+    hl_selection_score_head: str = "v"  # "v" (γ=0.0 trains V) or "q"
     
     # Template and perspective configuration
     templates_path: str = "src/configs/templates.json"
@@ -268,6 +339,21 @@ class ModelConfig:
     target_update_freq: int = 100  # How often to update target network
     dqn_gamma: float = 0.99     # Discount factor for DQN
 
+    # Layer 1 tool-index policy (3-layer tool red-team)
+    use_tool_index_policy: bool = False
+    tool_registry_path: str = "src/agentharm_gen/generated/tool_registry.json"
+    tool_index_lr: float = 1e-4
+    tool_index_gamma: float = 0.99
+    tool_index_epsilon_start: float = 1.0
+    tool_index_epsilon_end: float = 0.05
+    tool_index_epsilon_decay: int = 350
+    tool_index_replay_size: int = 50_000
+    tool_index_batch_size: int = 64
+    tool_index_target_update_freq: int = 1_000
+    tool_index_max_chunk_size: int = 2
+    tool_index_max_seq_length: int = 2048
+    l1_option_max_steps: int = 5
+
 
 @dataclass
 class EnvironmentConfig:
@@ -279,15 +365,26 @@ class EnvironmentConfig:
     # Environment settings
     harm_threshold: float = 1.5
     max_steps: int = 5
-    batch_size: int = 1
+    batch_size: int = 8  # Increased from 1 for better efficiency
     max_new_tokens: int = 100  # Maximum tokens to generate for model responses
+    
+    # Judge model batching settings
+    judge_batch_size: int = 16  # Batch size for judge model scoring (reduced to prevent OOM)
     
     # NEW: Warmup conversation bandwidth (fewer tokens generated during warmup)
     warmup_max_new_tokens: int = 20
     
     # Target model settings
     target_model: Optional[str] = "meta-llama/Llama-3.2-1B-Instruct"
-    
+
+    # Reasoning effort for OpenAI reasoning-capable target models (e.g. gpt-5 family).
+    # When non-None, the OpenAI target is configured as a reasoning model:
+    # the chat completion call uses `max_completion_tokens` instead of `max_tokens`,
+    # drops unsupported sampling params (temperature / top_p / penalties),
+    # and passes `reasoning_effort=<value>` to the API.
+    # Accepted values mirror the OpenAI API (e.g. "none", "minimal", "low", "medium", "high").
+    target_reasoning_effort: Optional[str] = None
+
     # Guard model settings
     guard_model: Optional[str] = "meta-llama/Llama-Guard-3-8B"
     
@@ -310,7 +407,7 @@ class EnvironmentConfig:
     guard_max_cpu_memory: Optional[str] = None
 
     # Enable usage of LMRL-Gym general environments instead of adversarial MultiStepEnv
-    use_lmrl: bool = False
+    use_mcq_env: bool = False
     # Task identifier within LMRL-Gym (e.g., "maze", "wordle", "chess", "text_nav")
     lmrl_task: Optional[str] = None
     # Free-form options passed to the task factory (e.g., {"maze_name": "umaze", "max_steps": 50})
@@ -367,7 +464,7 @@ class AgentConfig:
     VALID_ATTACK_TYPES: ClassVar[List[str]] = ["standard", "breakdown"]
     
     # Validation constants
-    VALID_HIGH_LEVEL_POLICY_TYPES: ClassVar[List[str]] = ["dqn", "ppo", "llm", "hybrid"]
+    VALID_HIGH_LEVEL_POLICY_TYPES: ClassVar[List[str]] = ["dqn", "ppo", "llm", "hybrid", "freeform"]
 
     
     def __post_init__(self):
@@ -380,7 +477,15 @@ class AgentConfig:
         
         if self.model.high_level_policy_type not in self.VALID_HIGH_LEVEL_POLICY_TYPES:
             raise ValueError(f"Invalid high-level policy type: {self.model.high_level_policy_type}. Must be one of {self.VALID_HIGH_LEVEL_POLICY_TYPES}")
-        
+
+        if self.model.hl_selection_score_head not in ("v", "q"):
+            raise ValueError(
+                f"hl_selection_score_head must be 'v' or 'q', got {self.model.hl_selection_score_head!r}"
+            )
+        if self.model.hl_critic_selection and self.model.hl_selection_n_candidates < 2:
+            raise ValueError(
+                "hl_critic_selection requires hl_selection_n_candidates >= 2"
+            )
 
         
         if self.training.batch_size <= 0:
@@ -442,6 +547,16 @@ class AgentConfig:
             model_dict = config_dict.get("model", {})
             env_dict = config_dict.get("environment", {})
             semantic_dict = config_dict.get("semantic_analysis", {})
+            
+            # Convert config objects to dicts if needed
+            if not isinstance(training_dict, dict):
+                training_dict = vars(training_dict) if hasattr(training_dict, '__dict__') else {}
+            if not isinstance(model_dict, dict):
+                model_dict = vars(model_dict) if hasattr(model_dict, '__dict__') else {}
+            if not isinstance(env_dict, dict):
+                env_dict = vars(env_dict) if hasattr(env_dict, '__dict__') else {}
+            if not isinstance(semantic_dict, dict):
+                semantic_dict = vars(semantic_dict) if hasattr(semantic_dict, '__dict__') else {}
         else:
             # Flat format - extract component configs from top level
             training_dict = {k: v for k, v in config_dict.items() 
@@ -460,10 +575,21 @@ class AgentConfig:
             'ce_coef': 'entropy_coef',  # Old name -> new name
             'adv_coef': None,  # Removed field
             'sem_coef': None,  # Removed field
+            # ATV mode removed
+            'atv_training_mode': None,
+            'atv_supervised_epochs': None,
+            'atv_rl_episodes': None,
+            'atv_learning_rate': None,
+            'atv_batch_size': None,
+            'atv_llamaguard_threshold': None,
+            'atv_reward_threshold': None,
         }
         
         model_field_mappings = {
             'detune': None,  # Removed field
+            'ds_config_path': None,  # DeepSpeed config removed
+            'atv_config': None,  # ATV high-level policy removed
+            'enable_device_map': None,  # Device map handled elsewhere
         }
         
         env_field_mappings = {

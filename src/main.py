@@ -6,8 +6,13 @@ This file provides a command-line interface to train and evaluate RL agents
 using the refactored, component-based architecture.
 """
 
-from datetime import datetime
+# Set CUDA debugging environment variables BEFORE any imports
 import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'  # For consistent GPU ordering
+
+from datetime import datetime
 import sys
 import argparse
 import json
@@ -16,19 +21,23 @@ import torch
 import numpy as np
 import time
 from typing import Dict, Any, Optional, List, Union, Tuple
-
+import transformers
 # Add the src directory to the path if running from the project root
 if os.path.basename(os.getcwd()) != "src":
     sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
-from src.agent_trainer import AgentTrainer
+# Add LMRL-Gym to the path when present (legacy LMRL MCQ tasks only).
+lmrl_gym_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LMRL-Gym")
+if os.path.exists(lmrl_gym_path):
+    sys.path.insert(0, lmrl_gym_path)
+    print(f"Added LMRL-Gym to Python path: {lmrl_gym_path}")
+
+from src.trainer.core import AgentTrainer
 from src.config import AgentConfig, TrainingConfig, ModelConfig, EnvironmentConfig
 from src.base import Environment, Policy, Critic, BaseModelSingleton
 from src.environment import MultiStepEnv
-from src.general.lmrl_factory import build_lmrl_environment
-from src.policies import LowLevelPolicy
+from src.policies.low_level import LowLevelPolicy
 from src.critics import TokenLevelValueCritic, SequenceLevelValueCritic
-from src.mcq_agent_trainer import MCQAgentTrainer
 
 # Import distributed training utilities if available
 from src.distributed_utils import DistributedSetup
@@ -46,7 +55,6 @@ def parse_args() -> argparse.Namespace:
     
     # Configuration arguments
     parser.add_argument("--config_path", type=str, help="Path to JSON configuration file")
-    parser.add_argument("--deepspeed_config_path", type=str, help="Path to DeepSpeed configuration file")
     
     # Add dynamic arguments for all config fields
     _add_config_arguments(parser)
@@ -201,10 +209,13 @@ def build_config_from_args(args: argparse.Namespace) -> AgentConfig:
             if config.training.debug_mode:
                 print("==DEBUG MODE ENABLED==")
         except Exception as e:
-            # Re-raise the exception with additional context
             import traceback
+            print(f"ERROR: Failed to load configuration from {args.config_path}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
             traceback.print_exc()
-            raise ValueError(f"Error loading configuration from {args.config_path}: {e}")
+            raise
     
     # Apply command line arguments to appropriate config objects
     _apply_args_to_config(args, training_config, model_config, env_config)
@@ -225,10 +236,6 @@ def build_config_from_args(args: argparse.Namespace) -> AgentConfig:
     if hasattr(args, 'force') and args.force:
         config.training.force_checkpoint_loading = True
         print("Force flag enabled: will continue training even if some models are missing from checkpoint")
-    
-    # Add DeepSpeed config path if provided
-    if args.deepspeed_config_path is not None:
-        config.deepspeed_config_path = args.deepspeed_config_path
     
     return config
 
@@ -271,7 +278,7 @@ def _apply_args_to_config(args: argparse.Namespace, training_config: TrainingCon
     # Apply all other arguments dynamically
     for arg_name, arg_value in vars(args).items():
         # Skip special arguments that are handled separately
-        if arg_name in ['train', 'test', 'config_path', 'deepspeed_config_path', 
+        if arg_name in ['train', 'test', 'config_path',
                        'use_token_masked_computation', 'disable_token_masked_computation',
                        'device', 'log_level', 'learning_rate', 'checkpoint', 'data_dir']:
             continue
@@ -285,20 +292,17 @@ def _apply_args_to_config(args: argparse.Namespace, training_config: TrainingCon
             field_type = next((f.type for f in fields(TrainingConfig) if f.name == arg_name), None)
             if field_type == bool and arg_name not in explicit_args:
                 continue  # Skip default boolean values
-            if hasattr(training_config, arg_name):
-                setattr(training_config, arg_name, arg_value)
+            setattr(training_config, arg_name, arg_value)
         elif arg_name in model_fields:
             field_type = next((f.type for f in fields(ModelConfig) if f.name == arg_name), None)
             if field_type == bool and arg_name not in explicit_args:
                 continue  # Skip default boolean values
-            if hasattr(model_config, arg_name):
-                setattr(model_config, arg_name, arg_value)
+            setattr(model_config, arg_name, arg_value)
         elif arg_name in env_fields:
             field_type = next((f.type for f in fields(EnvironmentConfig) if f.name == arg_name), None)
             if field_type == bool and arg_name not in explicit_args:
                 continue  # Skip default boolean values
-            if hasattr(env_config, arg_name):
-                setattr(env_config, arg_name, arg_value)
+            setattr(env_config, arg_name, arg_value)
     
     # Handle special backward compatibility for use_offloading
     if hasattr(args, 'use_offloading') and args.use_offloading:
@@ -322,25 +326,15 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
     print("Initializing model singletons and tokenizers...")
     
     #set attention method to flash attention 2
-    if hasattr(config, "attn_implementation"):
-        config.attn_implementation = "flash_attention_2"
-        print(f"Using attention implementation flash attention 2")
+    config.attn_implementation = "flash_attention_2"
+    print(f"Using attention implementation flash attention 2")
     
     # Initialize agent and critic singletons
     agent_singleton = BaseModelSingleton.get_instance(
         model_name=config.model.hf_checkpoint,
         use_offloading=config.training.use_offloading,
         config=config,
-        ds_config=None,  # Will set after initialization
         instance_tag="agent"
-    )
-    
-    critic_singleton = BaseModelSingleton.get_instance(
-        model_name=config.model.hf_checkpoint,
-        use_offloading=config.training.use_offloading,
-        config=config,
-        ds_config=None,  # Will set after initialization
-        instance_tag="critic"
     )
     
     # Initialize main tokenizer
@@ -349,25 +343,22 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
         use_fast=True,
         padding_side='left'
     )
+    tokenizer.padding_side = 'left'
     
     # Set pad token to eos token if not set
     if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        else:
-            tokenizer.add_special_tokens({'pad_token': '<|pad_token|>'})
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Ensure padding settings are correct
+    from src.utils import ensure_tokenizer_padding_settings
+    tokenizer = ensure_tokenizer_padding_settings(tokenizer)
     
     # Update singletons with tokenizer
     agent_singleton.tokenizer = tokenizer
-    critic_singleton.tokenizer = tokenizer
     
-    # ------------------------------------------------------------------
-    # Force FlashAttention2 on all main backbones to avoid SDPA fallbacks.
-    for _singleton in (agent_singleton, critic_singleton):
-        _singleton.base_model.config.attn_implementation = "flash_attention_2"
-        print(f"Using attention implementation flash attention 2 for {_singleton.model_name}")
-    # ------------------------------------------------------------------
+    agent_singleton.base_model.config.attn_implementation = "flash_attention_2"
+    print(f"Using attention implementation flash attention 2 for {agent_singleton.model_name}")
     
     # Initialize target and guard singletons
     target_singleton = None
@@ -378,15 +369,22 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
     # Determine GPU placement strategy for multi-GPU setups
     # Strategy: GPU 0 for agent models (training), GPU 1 for inference models (target + guard)
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    
-    if 'target_model' in config.environment.__dict__ and config.environment.target_model:
+    env_task = getattr(config.environment, "env_task", None)
+    is_agentharm = env_task in ("agentharm", "agentharm_gen")
+
+    if is_agentharm:
+        print(
+            "AgentHarm environment: defender loads via inspect_ai on GPU 1 "
+            "(skipping BaseModelSingleton target load)"
+        )
+    elif 'target_model' in config.environment.__dict__ and config.environment.target_model:
         target_model_name = config.environment.target_model
         # Use default model if not specified
         if target_model_name is None:
             target_model_name = "meta-llama/Llama-3.2-1B-Instruct"
         
         # Check if this is an OpenAI model
-        openai_models = ["gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "gpt-4-turbo"]
+        openai_models = ["gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "gpt-4-turbo", "gpt-5"]
         is_openai_target = any(target_model_name.startswith(model) for model in openai_models)
         
         if is_openai_target:
@@ -410,7 +408,6 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
                 model_name=target_model_name,
                 use_offloading=config.training.use_offloading,
                 config=config,
-                ds_config=None,
                 prefer_gpu=target_prefer_gpu,
                 quantize=target_quantize,
                 instance_tag="target"
@@ -422,26 +419,23 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
                 use_fast=True,
                 padding_side='left'
             )
+            target_tokenizer.padding_side = 'left'
             
             # Set pad token to eos token if not set
             if target_tokenizer.pad_token is None:
-                if target_tokenizer.eos_token is not None:
-                    target_tokenizer.pad_token = target_tokenizer.eos_token
-                    target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
-                else:
-                    target_tokenizer.add_special_tokens({'pad_token': '<|pad_token|>'})
+                target_tokenizer.pad_token = target_tokenizer.eos_token
+                target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+            
+            # Ensure padding settings are correct
+            target_tokenizer = ensure_tokenizer_padding_settings(target_tokenizer)
             
             target_singleton.tokenizer = target_tokenizer
-            if hasattr(target_singleton.base_model.config, "attn_implementation"):
-                target_singleton.base_model.config.attn_implementation = "flash_attention_2"
-                print(f"Using attention implementation flash attention 2 for target model")
+            target_singleton.base_model.config.attn_implementation = "flash_attention_2"
+            print(f"Using attention implementation flash attention 2 for target model")
             
-    # Determine if the guard model is needed for this run. We skip for ARC/HellaSwag
-    # (LMRL-Gym single-turn) and for the multi-turn MC environment.
+    # Determine if the guard model is needed for this run.
     should_load_guard = True
-    if getattr(config.environment, 'use_lmrl', False):
-        should_load_guard = False
-    if getattr(config.environment, 'env_task', None) == 'mc_multiturn':
+    if getattr(config.environment, 'env_task', None) in ('agentharm', 'agentharm_gen'):
         should_load_guard = False
 
     if should_load_guard and ('guard_model' in config.environment.__dict__ and config.environment.guard_model):
@@ -464,7 +458,6 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
             model_name=guard_model_name,
             use_offloading=config.training.use_offloading,
             config=config,
-            ds_config=None,
             prefer_gpu=guard_prefer_gpu,
             quantize=guard_quantize,
             instance_tag="guard"
@@ -476,51 +469,35 @@ def setup_model_singletons(config: AgentConfig) -> Dict[str, Any]:
             use_fast=True,
             padding_side='left'
         )
+        guard_tokenizer.padding_side = 'left'
         
         # Set pad token to eos token if not set
         if guard_tokenizer.pad_token is None:
-            if guard_tokenizer.eos_token is not None:
-                guard_tokenizer.pad_token = guard_tokenizer.eos_token
-                guard_tokenizer.pad_token_id = guard_tokenizer.eos_token_id
-            else:
-                guard_tokenizer.add_special_tokens({'pad_token': '<|pad_token|>'})
+            guard_tokenizer.pad_token = guard_tokenizer.eos_token
+            guard_tokenizer.pad_token_id = guard_tokenizer.eos_token_id
+        
+        # Ensure padding settings are correct
+        guard_tokenizer = ensure_tokenizer_padding_settings(guard_tokenizer)
         
         guard_singleton.tokenizer = guard_tokenizer
-        if hasattr(guard_singleton.base_model.config, "attn_implementation"):
-            guard_singleton.base_model.config.attn_implementation = "flash_attention_2"
-            print(f"Using attention implementation flash attention 2 for guard model")
+        guard_singleton.base_model.config.attn_implementation = "flash_attention_2"
+        print(f"Using attention implementation flash attention 2 for guard model")
     else:
         guard_singleton = None
         guard_tokenizer = None
-    
-    # Load DeepSpeed config if provided
-    ds_config = None
-    ds_cfg_path = None
-    if hasattr(config, 'deepspeed_config_path') and config.deepspeed_config_path:
-        ds_cfg_path = config.deepspeed_config_path
-    elif hasattr(config.model, 'ds_config_path') and config.model.ds_config_path:
-        ds_cfg_path = config.model.ds_config_path
-
-    if ds_cfg_path:
-        try:
-            with open(ds_cfg_path, 'r') as f:
-                ds_config = json.load(f)
-            print(f"Loaded DeepSpeed configuration from {ds_cfg_path}")
-        except Exception as e:
-            print(f"Warning: Failed to load DeepSpeed config: {e}")
-    
-    # Update singletons with DeepSpeed config
-    agent_singleton.ds_config = ds_config
-    critic_singleton.ds_config = ds_config
     
     # Initialize LoRA for the agent model if enabled
     if config.model.use_lora:
         print(f"Initializing LoRA for agent model targeting specific layers")
         agent_singleton.initialize_with_lora(config.model)
+
+    print(
+        "Single shared backbone on GPU 0: critics (value MLPs), L1 encoder, "
+        "L2/L3 policies (LoRA adapters switched via set_adapter)"
+    )
     
     return {
         "agent": agent_singleton,
-        "critic": critic_singleton,
         "tokenizer": tokenizer,
         "target": target_singleton,
         "target_tokenizer": target_tokenizer,
@@ -552,59 +529,45 @@ def build_environment(config: AgentConfig, tokenizer, singletons: Dict[str, Any]
     
     # Get the HF token from the environment if available
     hf_token = os.environ.get("HF_TOKEN") or None
-    
-    # If using LMRL-Gym tasks, build via adapter (no guard required)
-    if getattr(config.environment, "use_lmrl", False):
-        task = config.environment.lmrl_task
-        if not task:
-            raise ValueError("use_lmrl=True but no lmrl_task provided in EnvironmentConfig")
-        # Batch size for our framework is in TrainingConfig.batch_size
-        batch_size = int(config.training.batch_size)
-        options = dict(config.environment.lmrl_options)
-        # Also pass seed/options spaces for underlying envs if present
-        if config.training.seed is not None:
-            options.setdefault("seed", config.training.seed)
-        env = build_lmrl_environment(task=task, batch_size=batch_size, options=options)
-        return env
-    
-    # New multi-turn HF MC environment path (no guard required)
-    env_task = getattr(config.environment, "env_task", None)
-    if env_task == "mc_multiturn":
-        from src.general.mc_multiturn_env import MultiTurnMultipleChoiceEnv
-        # Pull dataset options from environment.lmrl_options for consistency
-        options = dict(getattr(config.environment, "lmrl_options", {}))
-        dataset_id = options.get("dataset_id")
-        if not dataset_id:
-            raise ValueError("env_task=mc_multiturn requires lmrl_options.dataset_id")
-        subset = options.get("subset")
-        split = options.get("split", "train")
-        max_examples = options.get("max_examples")
-        shuffle = bool(options.get("shuffle", True))
-        max_turns = int(options.get("max_turns", 10))
-        batch_size = int(config.training.batch_size)
-        judge_model_singleton = singletons.get("target")  # reuse target as judge per plan
-        judge_tokenizer = singletons.get("target_tokenizer")
-        judge_prompt_config = options.get("judge_prompt_config", {})
-        if dataset_id.endswith("ai2_arc") and not subset:
-            raise ValueError("'allenai/ai2_arc' requires 'subset' in lmrl_options")
-        return MultiTurnMultipleChoiceEnv(
-            dataset_id=dataset_id,
-            subset=subset,
-            split=split,
-            seed=config.training.seed,
-            max_examples=max_examples,
-            shuffle=shuffle,
-            hf_token=hf_token,
-            batch_size=batch_size,
-            max_turns=max_turns,
-            judge_model_singleton=judge_model_singleton,
-            judge_tokenizer=judge_tokenizer,
-            judge_prompt_config=judge_prompt_config,
-			max_new_tokens=getattr(config.environment, 'max_new_tokens', None),
-			warmup_max_new_tokens=getattr(config.environment, 'warmup_max_new_tokens', None),
 
+    env_task = getattr(config.environment, "env_task", None)
+    if getattr(config.environment, "use_mcq_env", False):
+        raise ValueError("use_mcq_env is no longer supported; remove it from the config")
+    if env_task in ("mc_multiturn", "hierarchical_twenty_questions", "twenty_questions"):
+        raise ValueError(f"env_task={env_task!r} is no longer supported")
+
+    if env_task == "agentharm":
+        from src.agentharm.factory import build_agentharm_environment
+
+        options = dict(getattr(config.environment, "lmrl_options", {}))
+        batch_size = int(getattr(config.environment, "batch_size", config.training.batch_size))
+        evaluation_mode = getattr(config.environment, "evaluation_mode", False)
+        return build_agentharm_environment(
+            batch_size=batch_size,
+            options=options,
+            target_model_name=config.environment.target_model,
+            max_steps=config.environment.max_steps,
+            max_new_tokens=getattr(config.environment, "max_new_tokens", None),
+            debug_mode=config.training.debug_mode,
+            evaluation_mode=evaluation_mode,
         )
-    
+
+    if env_task == "agentharm_gen":
+        from src.agentharm_gen.factory import build_agentharm_gen_environment
+
+        options = dict(getattr(config.environment, "lmrl_options", {}))
+        batch_size = int(getattr(config.environment, "batch_size", config.training.batch_size))
+        evaluation_mode = getattr(config.environment, "evaluation_mode", False)
+        return build_agentharm_gen_environment(
+            batch_size=batch_size,
+            options=options,
+            target_model_name=config.environment.target_model,
+            max_steps=config.environment.max_steps,
+            max_new_tokens=getattr(config.environment, "max_new_tokens", None),
+            debug_mode=config.training.debug_mode,
+            evaluation_mode=evaluation_mode,
+        )
+
     # Verify required singletons are available for MultiStepEnv
     if "guard" not in singletons or singletons["guard"] is None:
         raise ValueError("Guard model singleton not initialized")
@@ -636,15 +599,28 @@ def build_policy(config: AgentConfig, singletons: Dict[str, Any], env: Environme
     Args:
         config: Agent configuration
         singletons: Dictionary of model singletons
+        env: Environment instance
         
     Returns:
         Policy instance
     """
+    # Get model from singleton if available, otherwise None (will load from checkpoint)
+    agent_singleton = singletons.get("agent")
+    # Use PEFT model if LoRA is enabled, otherwise use base model
+    if agent_singleton is not None:
+        if config.model.use_lora and agent_singleton.peft_model is not None:
+            model = agent_singleton.peft_model
+        else:
+            model = agent_singleton.base_model
+    else:
+        model = None
+    
+    
     # Build standard policy
     policy = LowLevelPolicy(
         hf_checkpoint=config.model.hf_checkpoint,
         tokenizer=singletons["tokenizer"],
-        model=singletons["agent"].base_model,
+        model=model,
         use_lora=config.model.use_lora,
         adapter_name="base_model" if config.model.use_lora else None,
         env=env
@@ -673,18 +649,20 @@ def build_critics(config: AgentConfig, singletons: Dict[str, Any]) -> Dict[str, 
     """
     critics = {}
     
+    shared_backbone = singletons["agent"].shared_model
+
     # Sequence-level critic
     sequence_critic = SequenceLevelValueCritic(
         hf_checkpoint=config.model.hf_checkpoint,
         tokenizer=singletons["tokenizer"],
-        model=singletons["critic"].base_model
+        model=shared_backbone
     )
     
     # Token-level critic
     token_critic = TokenLevelValueCritic(
         hf_checkpoint=config.model.hf_checkpoint,
         tokenizer=singletons["tokenizer"],
-        model=singletons["critic"].base_model
+        model=shared_backbone
     )
     
     # Set up forward hooks with configuration for both critics
@@ -705,6 +683,41 @@ def build_critics(config: AgentConfig, singletons: Dict[str, Any]) -> Dict[str, 
     
     return critics
 
+def build_tool_index_policy(config: AgentConfig, singletons: Dict[str, Any]) -> Optional[Any]:
+    """Build Layer 1 MLP tool-index policy when enabled."""
+    if not getattr(config.model, "use_tool_index_policy", False):
+        return None
+
+    from src.agentharm_gen.harness.registry import load_tool_registry
+    from src.policies.tool_index.policy import ToolIndexPolicy
+
+    registry_path = getattr(
+        config.model,
+        "tool_registry_path",
+        "src/agentharm_gen/generated/tool_registry.json",
+    )
+    tool_registry = load_tool_registry(registry_path)
+    encoder = singletons["agent"].shared_model
+    device = next(encoder.parameters()).device
+
+    return ToolIndexPolicy(
+        encoder=encoder,
+        tokenizer=singletons["tokenizer"],
+        tool_registry=tool_registry,
+        lr=config.model.tool_index_lr,
+        gamma=config.model.tool_index_gamma,
+        epsilon_start=config.model.tool_index_epsilon_start,
+        epsilon_end=config.model.tool_index_epsilon_end,
+        epsilon_decay=config.model.tool_index_epsilon_decay,
+        replay_size=config.model.tool_index_replay_size,
+        batch_size=config.model.tool_index_batch_size,
+        target_update_freq=config.model.tool_index_target_update_freq,
+        max_chunk_size=config.model.tool_index_max_chunk_size,
+        max_seq_length=config.model.tool_index_max_seq_length,
+        device=device,
+    )
+
+
 def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> Optional[Any]:
     """
     Build the high-level policy component if enabled.
@@ -716,32 +729,37 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
     Returns:
         High-level policy instance or None if not enabled
     """
+    # Frozen high-level (fixed instruction): use hierarchical format with constant instruction.
+    # When fixed_high_level_instruction is set, we always build FixedHighLevelPolicy so that
+    # blankhl/fixedhl ablation configs get the hierarchical prompt format without training HL.
+    fixed_instr = getattr(config.model, 'fixed_high_level_instruction', None)
+    if fixed_instr is not None:
+        encoder = singletons["agent"].shared_model
+        device = next(encoder.parameters()).device
+        from src.policies.high_level.fixed import FixedHighLevelPolicy  # local import to avoid overhead if not needed
+        return FixedHighLevelPolicy(instruction=fixed_instr, device=device)
+
     # Early exit: user disabled the high-level policy.
     if not getattr(config.model, 'use_high_level_policy', False):
         return None
 
-    # From this point we know a high-level policy *is* requested.
-    fixed_instr = getattr(config.model, 'fixed_high_level_instruction', None)
-
-    # Device shared with critic (encoder)
-    encoder = singletons["critic"].base_model
+    # From this point we know a high-level policy *is* requested (trainable).
+    # Device shared with agent backbone (encoder)
+    encoder = singletons["agent"].shared_model
     device = next(encoder.parameters()).device
-
-    # ------------------------------------------------------------------ fixed-policy path (still counted as high-level)
-    if fixed_instr is not None:
-        from fixed_high_level_policy import FixedHighLevelPolicy  # local import to avoid overhead if not needed
-        return FixedHighLevelPolicy(instruction=fixed_instr, device=device)
 
     # ------------------------------------------------------------------ hybrid policy path
     policy_type = getattr(config.model, 'high_level_policy_type', 'dqn')
+    if getattr(config.training, 'use_freeform_high_level', False):
+        policy_type = 'freeform'
     hybrid_enabled = getattr(config.model, 'hybrid_policy_enabled', False)
     
     if policy_type == 'hybrid' and hybrid_enabled:
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Building hybrid high-level policy...")
         
         # Build DQN policy component for template selection
-        from high_level_policy import TemplateHighLevelPolicy
-        embedding_dim = singletons["critic"].base_model.config.hidden_size
+        from src.policies.high_level.template_dqn import TemplateHighLevelPolicy
+        embedding_dim = singletons["agent"].shared_model.config.hidden_size
         
         # For hybrid policies, we use DQN-based template selection
         dqn_policy = TemplateHighLevelPolicy(
@@ -772,9 +790,14 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             import os
             
             hf_token = os.environ.get("HF_TOKEN")
-            llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, token=hf_token)
+            llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, token=hf_token, padding_side="left")
+            llm_tokenizer.padding_side = 'left'
             if llm_tokenizer.pad_token is None:
                 llm_tokenizer.pad_token = llm_tokenizer.eos_token
+                llm_tokenizer.pad_token_id = llm_tokenizer.eos_token_id
+            
+            # Ensure padding settings are correct
+            llm_tokenizer = ensure_tokenizer_padding_settings(llm_tokenizer)
             
             # Load with quantization if specified
             if llm_quantize:
@@ -805,7 +828,7 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             llm_tokenizer = singletons["tokenizer"]
         
         # Create hybrid policy
-        from hybrid_high_level_policy import HybridHighLevelPolicy
+        from src.policies.high_level.hybrid import HybridHighLevelPolicy
         
         # Build prompt diversity config from model settings
         prompt_diversity_config = {
@@ -824,8 +847,6 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             instruction_prompts_path="src/configs/instruction_prompts.json",
             prompt_diversity_config=prompt_diversity_config,
             max_new_tokens=getattr(config.model, 'hybrid_max_new_tokens', 48),
-            temperature=getattr(config.model, 'hybrid_temperature', 0.8),
-            top_p=getattr(config.model, 'hybrid_top_p', 0.9),
             device=device
         )
         
@@ -835,7 +856,7 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
     elif policy_type == 'llm':
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Building pure LLM high-level policy...")
         
-        from llm_high_level_policy import LLMHighLevelPolicy
+        from src.policies.high_level.llm import LLMHighLevelPolicy
         
         # Use main agent model or separate LLM
         llm_model = singletons["agent"].base_model
@@ -845,8 +866,6 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             model=llm_model,
             tokenizer=llm_tokenizer,
             max_new_tokens=32,
-            temperature=0.7,
-            top_p=0.95,
             device=device
         )
         
@@ -860,13 +879,13 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Converting 'mlp' alias to 'dqn' for backward compatibility")
         
         # Default to DQN if no policy type specified or if it's not recognized
-        if policy_type not in ["dqn", "ppo", "llm", "hybrid"]:
+        if policy_type not in ["dqn", "ppo", "llm", "hybrid", "freeform"]:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Unknown policy type '{policy_type}', defaulting to 'dqn'")
             policy_type = "dqn"
         
         if policy_type == "dqn":
             # Use TemplateHighLevelPolicy for pure DQN-based template selection
-            from high_level_policy import TemplateHighLevelPolicy
+            from src.policies.high_level.template_dqn import TemplateHighLevelPolicy
             
             # Get templates path
             templates_path = getattr(config.model, 'templates_path', 'src/configs/templates.json')
@@ -902,22 +921,20 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
             )
         elif policy_type == "llm":
             # Use LLMHighLevelPolicy for LLM-based instruction generation
-            from llm_high_level_policy import LLMHighLevelPolicy
+            from src.policies.high_level.llm import LLMHighLevelPolicy
             
             high_level_policy = LLMHighLevelPolicy(
                 model=singletons["agent"].base_model,
                 tokenizer=singletons["tokenizer"],
                 max_new_tokens=32,
-                temperature=0.7,
-                top_p=0.95,
                 device=device
             )
         elif policy_type == "hybrid":
             # Use HybridHighLevelPolicy for MLP + LLM combination
-            from hybrid_high_level_policy import HybridHighLevelPolicy
+            from src.policies.high_level.hybrid import HybridHighLevelPolicy
             
             # Build DQN component for hybrid policy
-            from high_level_policy import TemplateHighLevelPolicy
+            from src.policies.high_level.template_dqn import TemplateHighLevelPolicy
             templates_path = getattr(config.model, 'templates_path', 'src/configs/templates.json')
             dqn_policy = TemplateHighLevelPolicy(
                 encoder=encoder,
@@ -952,10 +969,96 @@ def build_high_level_policy(config: AgentConfig, singletons: Dict[str, Any]) -> 
                 instruction_prompts_path="src/configs/instruction_prompts.json",
                 prompt_diversity_config=prompt_diversity_config,
                 max_new_tokens=getattr(config.model, 'hybrid_max_new_tokens', 48),
-                temperature=getattr(config.model, 'hybrid_temperature', 0.8),
-                top_p=getattr(config.model, 'hybrid_top_p', 0.9),
                 device=device
             )
+        elif policy_type == "freeform":
+            from src.policies.high_level.freeform import FreeformHighLevelPolicy
+            
+            # Get model for high-level policy - use PEFT model if LoRA is enabled
+            if config.model.use_lora and singletons["agent"].peft_model is not None:
+                high_level_model = singletons["agent"].peft_model
+            else:
+                high_level_model = singletons["agent"].base_model
+            
+            # Check if high-level policy needs separate LoRA adapter
+            high_level_use_lora = getattr(config.model, 'high_level_use_lora', None)
+            if high_level_use_lora is None:
+                high_level_use_lora = config.model.use_lora
+            
+            # Get high-level LoRA settings (default to low-level if not specified)
+            high_level_lora_r = getattr(config.model, 'high_level_lora_r', None) or config.model.lora_r
+            high_level_lora_alpha = getattr(config.model, 'high_level_lora_alpha', None) or config.model.lora_alpha
+            high_level_lora_dropout = getattr(config.model, 'high_level_lora_dropout', None) or config.model.lora_dropout
+            high_level_target_modules = getattr(config.model, 'high_level_target_modules', None) or config.model.target_modules
+            high_level_target_layers = getattr(config.model, 'high_level_target_layers', None) or config.model.target_layers
+            
+            # Check if high-level LoRA settings differ from low-level
+            settings_differ = (
+                high_level_use_lora and config.model.use_lora and (
+                    high_level_lora_r != config.model.lora_r or
+                    high_level_lora_alpha != config.model.lora_alpha or
+                    high_level_lora_dropout != config.model.lora_dropout or
+                    high_level_target_modules != config.model.target_modules or
+                    high_level_target_layers != config.model.target_layers
+                )
+            )
+            # When hl_only_training, low-level has no LoRA (use_lora=False); we still need a trainable high-level adapter
+            need_high_level_adapter = settings_differ or getattr(config.training, 'hl_only_training', False)
+
+            if need_high_level_adapter:
+                # Create a separate adapter for high-level policy
+                from dataclasses import dataclass
+                from typing import List
+                
+                @dataclass
+                class HighLevelLoRAConfig:
+                    use_lora: bool = True
+                    lora_r: int = 8
+                    lora_alpha: int = 16
+                    lora_dropout: float = 0.05
+                    target_modules: List[str] = None
+                    target_layers: List[int] = None
+                
+                high_level_lora_config = HighLevelLoRAConfig(
+                    use_lora=True,
+                    lora_r=high_level_lora_r,
+                    lora_alpha=high_level_lora_alpha,
+                    lora_dropout=high_level_lora_dropout,
+                    target_modules=high_level_target_modules,
+                    target_layers=high_level_target_layers
+                )
+                
+                # Add high-level adapter to the model
+                adapter_name = "high_level_policy"
+                if adapter_name not in singletons["agent"].available_adapters:
+                    print(f"Adding separate LoRA adapter '{adapter_name}' for high-level policy")
+                    print(f"  High-level LoRA config: r={high_level_lora_r}, alpha={high_level_lora_alpha}, dropout={high_level_lora_dropout}")
+                    print(f"  High-level target_modules: {high_level_target_modules}")
+                    print(f"  High-level target_layers: {high_level_target_layers}")
+                    singletons["agent"].add_adapter(adapter_name, high_level_lora_config)
+                else:
+                    print(f"High-level LoRA adapter '{adapter_name}' already exists")
+                high_level_model = singletons["agent"].peft_model
+
+            high_level_policy = FreeformHighLevelPolicy(
+                model=high_level_model,
+                tokenizer=singletons["tokenizer"],
+                max_new_tokens=getattr(config.model, 'freeform_max_new_tokens', 48),
+                temperature=getattr(config.model, 'freeform_temperature', 0.8),
+                top_p=getattr(config.model, 'freeform_top_p', 0.9),
+                device=device,
+                prompts_path=getattr(config.model, 'freeform_prompts_path', 'src/configs/freeform_prompts.json'),
+                prompt_template_id=getattr(config.model, 'freeform_prompt_template', None),
+                compute_log_probs_chunk_size=getattr(config.training, 'freeform_compute_log_probs_chunk_size', 2),
+                use_response_tags=getattr(config.model, 'freeform_use_response_tags', True),
+            )
+            
+            # Store adapter name for high-level policy if it has a separate adapter
+            if need_high_level_adapter and "high_level_policy" in singletons["agent"].available_adapters:
+                high_level_policy.adapter_name = "high_level_policy"
+                # Don't set adapter here - let the policy switch when it generates
+                # This avoids interfering with low-level policy's adapter
+                print(f"High-level policy will use adapter 'high_level_policy' when generating")
         
         return high_level_policy
 
@@ -1035,8 +1138,13 @@ def train_agent(config: AgentConfig):
             )
             print("Successfully loaded models from checkpoint")
         except Exception as e:
-            print(f"Error loading from checkpoint: {e}")
-            raise RuntimeError(f"Failed to load from checkpoint {config.training.load_from_checkpoint}: {e}")
+            import traceback
+            print(f"ERROR: Failed to load models from checkpoint {config.training.load_from_checkpoint}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
+            traceback.print_exc()
+            raise
     
     # Build policy
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Building policy...")
@@ -1066,6 +1174,21 @@ def train_agent(config: AgentConfig):
     
     sequence_critic.train()
     token_critic.train()
+
+    # Critic-only mode: freeze LL + HL; only sequence critic trains
+    if getattr(config.training, 'q1_only_training', False):
+        config.training.hl_only_training = True
+        config.training.freeze_high_level = True
+        print("Critic-only training: hl_only_training=True, freeze_high_level=True")
+
+    if getattr(config.training, 'reinit_sequence_critic', False):
+        print("Re-initializing sequence critic Q/V heads (fresh V for γ ablation)")
+        sequence_critic._init_value_head()
+        device_for_heads = next(sequence_critic.model.parameters()).device
+        dtype_for_heads = next(sequence_critic.model.parameters()).dtype
+        sequence_critic.value_head.to(device=device_for_heads, dtype=dtype_for_heads)
+        sequence_critic.state_value_head.to(device=device_for_heads, dtype=dtype_for_heads)
+        print(f"Reinit Q/V heads on {device_for_heads} dtype={dtype_for_heads}")
     
     # Handle v_high_critic (optional, for backward compatibility)
     v_high_critic = None
@@ -1081,15 +1204,9 @@ def train_agent(config: AgentConfig):
     
     # Explicitly move models to GPU for training
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Moving models to GPU...")
-    # Only move whole modules when not using device_map sharding
-    use_dm = bool(getattr(config.model, 'enable_device_map', False))
-    if not use_dm:
-        policy.to(device)
-        sequence_critic.to(device)
-        token_critic.to(device)
-    else:
-        # No full-module moves; inputs will be routed to the embedding shard device
-        pass
+    policy.to(device)
+    sequence_critic.to(device)
+    token_critic.to(device)
     
     # Verify gradient setup for critics
     seq_trainable_params = sum(p.numel() for p in sequence_critic.parameters() if p.requires_grad)
@@ -1106,46 +1223,54 @@ def train_agent(config: AgentConfig):
         if loaded_models and config.training.force_checkpoint_loading and high_level_policy is not None:
             print("Created new high-level policy (not found in checkpoint)")
     
+    tool_index_policy = build_tool_index_policy(config, model_singletons)
+    if tool_index_policy is not None:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Building tool-index policy (L1)...")
+        tool_index_policy.train()
+        tool_index_policy.to(device)
+
     if high_level_policy is not None:
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Building high-level policy...")
         high_level_policy.train()
-        # Move high-level policy only if not sharded
-        if not use_dm:
-            high_level_policy.to(device)
+        high_level_policy.to(device)
     
     # Update environment and policy with tokenizers
     env.tokenizer = model_singletons.get('tokenizer')
     policy.tokenizer = model_singletons.get('tokenizer')
     sequence_critic.tokenizer = model_singletons.get('tokenizer')
     token_critic.tokenizer = model_singletons.get('tokenizer')
-    if high_level_policy is not None:
+    # Freeform HL is a separate PEFT base (e.g. Zephyr) with its own tokenizer;
+    # overwriting with the agent tokenizer (e.g. Llama) breaks generation.
+    if high_level_policy is not None and getattr(high_level_policy, "policy_kind", None) != "freeform":
         high_level_policy.tokenizer = model_singletons.get('tokenizer')
     
     # ------------------------------------------------------------------
-    # Ensure LoRA adapter weights are marked trainable – certain wrappers
-    # (e.g. DeepSpeed-Inference) can flip ``requires_grad`` off.  We force
-    # any parameter whose name contains "lora_" to be trainable.
+    # When hl_only_training, freeze the low-level policy (no gradients).
+    # Otherwise ensure LoRA adapter weights are marked trainable.
     # ------------------------------------------------------------------
-    for n, p in policy.named_parameters():
-        if "lora_" in n:
-            p.requires_grad_(True)
+    if getattr(config.training, 'hl_only_training', False):
+        for p in policy.parameters():
+            p.requires_grad_(False)
+    else:
+        for n, p in policy.named_parameters():
+            if "lora_" in n:
+                p.requires_grad_(True)
 
     # Set up optimizers
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Setting up optimizers...")
     # ------------------------------------------------------------------
     # Optimise *only* the parameters that will actually receive gradients.
-    # This is typically the small set of LoRA adapter weights that sit on
-    # top of the frozen base model, or whichever parameters the user has
-    # explicitly left with ``requires_grad = True``.
+    # When hl_only_training, actor has no trainable params (high-level is trained separately).
     # ------------------------------------------------------------------
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
-    assert len(trainable_params) > 0, "No trainable parameters found for the actor – did you forget to enable LoRA or set requires_grad?"
+    if len(trainable_params) == 0 and not (getattr(config.training, 'hl_only_training', False) and high_level_policy is not None):
+        raise AssertionError("No trainable parameters found for the actor – did you forget to enable LoRA or set requires_grad?")
 
     actor_optimizer = torch.optim.Adam(
         trainable_params,
         lr=config.training.lr,
         eps=config.training.eps
-    )
+    ) if trainable_params else None
     sequence_critic_optimizer = torch.optim.Adam(
         sequence_critic.parameters(),
         lr=config.training.value_lr,
@@ -1157,9 +1282,9 @@ def train_agent(config: AgentConfig):
         eps=config.training.eps
     )
     
-    # High-level policy optimizer (optional)
+    # High-level policy optimizer (optional). Skip when freeze_high_level: HL used for rollout only, not trained.
     high_level_optimizer = None
-    if high_level_policy is not None:
+    if high_level_policy is not None and not getattr(config.training, 'freeze_high_level', False):
         high_level_optimizer = torch.optim.Adam(
             high_level_policy.parameters(),
             lr=getattr(config.model, 'high_level_lr', 0.001),
@@ -1172,14 +1297,17 @@ def train_agent(config: AgentConfig):
         print("Loading optimizer states from checkpoint...")
         
         try:
-            if "actor_optimizer" in optimizer_states:
+            if "actor_optimizer" in optimizer_states and actor_optimizer is not None:
                 actor_optimizer.load_state_dict(optimizer_states["actor_optimizer"])
                 print("Loaded actor optimizer state")
-            elif config.training.force_checkpoint_loading:
+            elif config.training.force_checkpoint_loading and actor_optimizer is not None:
                 print("Warning: Actor optimizer state not found in checkpoint, using fresh optimizer")
             if "sequence_critic_optimizer" in optimizer_states:
-                sequence_critic_optimizer.load_state_dict(optimizer_states["sequence_critic_optimizer"])
-                print("Loaded sequence critic optimizer state")
+                if getattr(config.training, 'reinit_sequence_critic', False):
+                    print("Skipping sequence critic optimizer load (reinit_sequence_critic=True)")
+                else:
+                    sequence_critic_optimizer.load_state_dict(optimizer_states["sequence_critic_optimizer"])
+                    print("Loaded sequence critic optimizer state")
             elif config.training.force_checkpoint_loading:
                 print("Warning: Sequence critic optimizer state not found in checkpoint, using fresh optimizer")
             if "token_critic_optimizer" in optimizer_states:
@@ -1193,17 +1321,20 @@ def train_agent(config: AgentConfig):
             elif config.training.force_checkpoint_loading and high_level_optimizer is not None:
                 print("Warning: High-level optimizer state not found in checkpoint, using fresh optimizer")
         except Exception as e:
-            print(f"Warning: Failed to load optimizer states: {e}")
-            print("Will continue with fresh optimizer states")
+            import traceback
+            print(f"ERROR: Failed to load optimizer states from checkpoint")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
+            traceback.print_exc()
+            raise
     else:
         print("No optimizer states found, using fresh optimizers")
     
     # Initialize trainer
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Initializing trainer...")
-    if config.environment.env_task == "mc_multiturn":
-        trainer_class = MCQAgentTrainer
-    else:
-        trainer_class = AgentTrainer
+    trainer_class = AgentTrainer
+    print("Using standard AgentTrainer")
     trainer = trainer_class(
         actor_optimizer=actor_optimizer,
         sequence_critic_optimizer=sequence_critic_optimizer,
@@ -1224,19 +1355,23 @@ def train_agent(config: AgentConfig):
         hl_only_training=config.training.hl_only_training
     )
     
-    # Register agent models for model swapping with DeepSpeed
+    # Register agent models for optional GPU model swapping
     trainer.register_agent_models(
         policy=policy,
         sequence_critic=sequence_critic,
         token_critic=token_critic,
         high_level_policy=high_level_policy
     )
+    trainer.tool_index_policy = tool_index_policy
     
     # Train the agent using the trainer
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: Starting training for {config.training.episodes} episodes...")
     
     # Create a wrapper function that passes config and high_level_policy to save_checkpoint
-    def save_checkpoint_wrapper(policy, sequence_critic, token_critic, episode, metrics, output_dir, is_final=False):
+    def save_checkpoint_wrapper(
+        policy, sequence_critic, token_critic, episode, metrics, output_dir,
+        is_final=False, is_best=False, **kwargs
+    ):
         return save_checkpoint(
             policy=policy,
             sequence_critic=sequence_critic,
@@ -1245,6 +1380,7 @@ def train_agent(config: AgentConfig):
             metrics=metrics,
             output_dir=output_dir,
             is_final=is_final,
+            is_best=is_best,
             config=config,
             high_level_policy=high_level_policy,
             v_high_critic=None
@@ -1282,7 +1418,13 @@ def train_agent(config: AgentConfig):
         try:
             generate_training_plots(losses_csv_path, run_log_dir)
         except Exception as e:
-            print(f"Failed to generate training plots: {e}")
+            import traceback
+            print(f"ERROR: Failed to generate training plots from {losses_csv_path}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
+            traceback.print_exc()
+            raise
     else:
         print(f"No losses CSV found at {losses_csv_path}")
     
@@ -1325,9 +1467,14 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
         try:
             episode_offset = int(checkpoint_name.split("_")[1])
             print(f"Detected checkpoint from episode {episode_offset}")
-        except (IndexError, ValueError):
-            print("Could not extract episode number from checkpoint name, starting from episode 0")
-            episode_offset = 0
+        except (IndexError, ValueError) as e:
+            import traceback
+            print(f"ERROR: Failed to extract episode number from checkpoint name {checkpoint_name}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
+            traceback.print_exc()
+            raise
     elif checkpoint_name == "final_model":
         # For final_model, we need to find the highest checkpoint number in the parent directory
         parent_dir = os.path.dirname(checkpoint_dir)
@@ -1338,9 +1485,14 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
                     episode_numbers = [int(d.split("_")[1]) for d in checkpoint_dirs]
                     episode_offset = max(episode_numbers)
                     print(f"Detected final model from episode {episode_offset}")
-                except (IndexError, ValueError):
-                    print("Could not extract episode number from checkpoint directories, starting from episode 0")
-                    episode_offset = 0
+                except (IndexError, ValueError) as e:
+                    import traceback
+                    print(f"ERROR: Failed to extract episode numbers from checkpoint directories")
+                    print(f"ERROR TYPE: {type(e).__name__}")
+                    print(f"ERROR MESSAGE: {str(e)}")
+                    print("FULL TRACEBACK:")
+                    traceback.print_exc()
+                    raise
             else:
                 print("No numbered checkpoints found, starting from episode 0")
                 episode_offset = 0
@@ -1360,8 +1512,13 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
             checkpoint_config = AgentConfig.from_dict(checkpoint_config_dict)
             print(f"Loaded configuration from checkpoint: {checkpoint_config_path}")
         except Exception as e:
-            print(f"Warning: Failed to load config from checkpoint, using provided config: {e}")
-            checkpoint_config = config
+            import traceback
+            print(f"ERROR: Failed to load config from checkpoint {checkpoint_config_path}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MESSAGE: {str(e)}")
+            print("FULL TRACEBACK:")
+            traceback.print_exc()
+            raise
     else:
         print("No config found in checkpoint, using provided config")
         checkpoint_config = config
@@ -1399,50 +1556,53 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
         else:
             raise FileNotFoundError(f"Policy not found in checkpoint: {policy_dir}")
         
-        # Load critics - they need to be instantiated first with the model, then loaded
-        if os.path.exists(sequence_critic_dir):
-            print("Loading sequence critic...")
-            sequence_critic = SequenceLevelValueCritic(
-                hf_checkpoint=config.model.hf_checkpoint,
-                tokenizer=model_singletons["tokenizer"],
-                model=model_singletons["critic"].base_model
-            )
-            sequence_critic.load(sequence_critic_dir)
-            loaded_models["sequence_critic"] = sequence_critic
-        elif force:
-            print("Warning: Sequence critic not found in checkpoint, will create new sequence critic")
+        # Load critics on the shared agent backbone (value heads only; no duplicate weights).
+        agent_singleton = model_singletons.get("agent", None)
+        shared_backbone = agent_singleton.shared_model if agent_singleton is not None else None
+        if shared_backbone is not None:
+            if os.path.exists(sequence_critic_dir):
+                print("Loading sequence critic...")
+                sequence_critic = SequenceLevelValueCritic(
+                    hf_checkpoint=config.model.hf_checkpoint,
+                    tokenizer=model_singletons["tokenizer"],
+                    model=shared_backbone,
+                )
+                sequence_critic.load(sequence_critic_dir)
+                loaded_models["sequence_critic"] = sequence_critic
+            elif force:
+                print("Warning: Sequence critic not found in checkpoint, will create new sequence critic")
+            else:
+                raise FileNotFoundError(f"Sequence critic not found in checkpoint: {sequence_critic_dir}")
+            
+            if os.path.exists(token_critic_dir):
+                print("Loading token critic...")
+                token_critic = TokenLevelValueCritic(
+                    hf_checkpoint=config.model.hf_checkpoint,
+                    tokenizer=model_singletons["tokenizer"],
+                    model=shared_backbone,
+                )
+                token_critic.load(token_critic_dir)
+                loaded_models["token_critic"] = token_critic
+            elif force:
+                print("Warning: Token critic not found in checkpoint, will create new token critic")
+            else:
+                raise FileNotFoundError(f"Token critic not found in checkpoint: {token_critic_dir}")
+            
+            # Load v_high critic if it exists (optional, for backward compatibility)
+            if os.path.exists(v_high_critic_dir):
+                print("Loading v_high critic...")
+                v_high_critic = SequenceLevelValueCritic(
+                    hf_checkpoint=config.model.hf_checkpoint,
+                    tokenizer=model_singletons["tokenizer"],
+                    model=shared_backbone,
+                )
+                v_high_critic.load(v_high_critic_dir)
+                loaded_models["v_high_critic"] = v_high_critic
+            else:
+                print("Note: v_high critic not found in checkpoint (this is optional for backward compatibility)")
+                loaded_models["v_high_critic"] = None
         else:
-            raise FileNotFoundError(f"Sequence critic not found in checkpoint: {sequence_critic_dir}")
-        
-        if os.path.exists(token_critic_dir):
-            print("Loading token critic...")
-            token_critic = TokenLevelValueCritic(
-                hf_checkpoint=config.model.hf_checkpoint,
-                tokenizer=model_singletons["tokenizer"],
-                model=model_singletons["critic"].base_model
-            )
-            token_critic.load(token_critic_dir)
-            loaded_models["token_critic"] = token_critic
-        elif force:
-            print("Warning: Token critic not found in checkpoint, will create new token critic")
-        else:
-            raise FileNotFoundError(f"Token critic not found in checkpoint: {token_critic_dir}")
-        
-        # Load v_high critic if it exists (optional, for backward compatibility)
-        if os.path.exists(v_high_critic_dir):
-            print("Loading v_high critic...")
-            # For now, we'll create a simple critic with the same architecture as sequence critic
-            # This can be enhanced later to support different v_high critic architectures
-            v_high_critic = SequenceLevelValueCritic(
-                hf_checkpoint=config.model.hf_checkpoint,
-                tokenizer=model_singletons["tokenizer"],
-                model=model_singletons["critic"].base_model
-            )
-            v_high_critic.load(v_high_critic_dir)
-            loaded_models["v_high_critic"] = v_high_critic
-        else:
-            print("Note: v_high critic not found in checkpoint (this is optional for backward compatibility)")
-            loaded_models["v_high_critic"] = None
+            print("No agent backbone in model_singletons; skipping critic loading.")
         
         # Load high-level policy if it exists
         if os.path.exists(high_level_policy_dir):
@@ -1457,44 +1617,49 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
             else:
                 policy_type = "dqn"  # Default for backward compatibility
             
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             if policy_type == "dqn":
                 # Import here to avoid circular imports
-                from high_level_policy import TemplateHighLevelPolicy
-                # Use the class method to load the policy directly
+                from src.policies.high_level.template_dqn import TemplateHighLevelPolicy
                 high_level_policy = TemplateHighLevelPolicy.load(
-                    high_level_policy_dir, 
-                    device="cuda" if torch.cuda.is_available() else "cpu"
+                    high_level_policy_dir,
+                    device=device,
                 )
                 # Set the actual encoder and tokenizer after loading
-                high_level_policy.encoder = model_singletons["critic"].base_model
-                high_level_policy.tokenizer = model_singletons["tokenizer"]
+                if agent_singleton is not None:
+                    high_level_policy.encoder = agent_singleton.shared_model
+                if "tokenizer" in model_singletons and model_singletons["tokenizer"] is not None:
+                    high_level_policy.tokenizer = model_singletons["tokenizer"]
             elif policy_type == "ppo":
-                # Import here to avoid circular imports
                 from ppo_template_policy import PPOTemplateHighLevelPolicy
-                # Load PPO policy with encoder and tokenizer
-                if model_singletons["critic"] is None:
-                    raise ValueError("Critic singleton not available for PPO high-level policy loading")
-                if model_singletons["tokenizer"] is None:
+                if agent_singleton is None:
+                    raise ValueError("Agent singleton not available for PPO high-level policy loading")
+                if model_singletons.get("tokenizer") is None:
                     raise ValueError("Tokenizer not available for PPO high-level policy loading")
                 high_level_policy = PPOTemplateHighLevelPolicy.load(
                     high_level_policy_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    encoder=model_singletons["critic"].base_model,
-                    tokenizer=model_singletons["tokenizer"]
+                    device=device,
+                    encoder=agent_singleton.shared_model,
+                    tokenizer=model_singletons["tokenizer"],
                 )
             elif policy_type == "llm":
-                # Import here to avoid circular imports
-                from llm_high_level_policy import LLMHighLevelPolicy
+                from src.policies.high_level.llm import LLMHighLevelPolicy
                 high_level_policy = LLMHighLevelPolicy.load(
                     high_level_policy_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu"
+                    device=device,
                 )
             elif policy_type == "hybrid":
-                # Import here to avoid circular imports
-                from hybrid_high_level_policy import HybridHighLevelPolicy
+                from src.policies.high_level.hybrid import HybridHighLevelPolicy
                 high_level_policy = HybridHighLevelPolicy.load(
                     high_level_policy_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu"
+                    device=device,
+                )
+            elif policy_type == "freeform":
+                # Mirror test_runner behavior for freeform high-level policy
+                from src.policies.high_level.freeform import FreeformHighLevelPolicy
+                high_level_policy = FreeformHighLevelPolicy.load(
+                    high_level_policy_dir,
+                    device=device,
                 )
             else:
                 raise ValueError(f"Unknown high-level policy type '{policy_type}'")
@@ -1511,7 +1676,9 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
         if os.path.exists(optimizer_dir):
             print("Loading optimizer states...")
             try:
-                optimizer_states["actor_optimizer"] = torch.load(os.path.join(optimizer_dir, "actor_optimizer.pt"))
+                actor_opt_path = os.path.join(optimizer_dir, "actor_optimizer.pt")
+                if os.path.exists(actor_opt_path):
+                    optimizer_states["actor_optimizer"] = torch.load(actor_opt_path)
                 optimizer_states["sequence_critic_optimizer"] = torch.load(os.path.join(optimizer_dir, "sequence_critic_optimizer.pt"))
                 optimizer_states["token_critic_optimizer"] = torch.load(os.path.join(optimizer_dir, "token_critic_optimizer.pt"))
                 
@@ -1522,8 +1689,13 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
                     
                 print("Successfully loaded optimizer states")
             except Exception as e:
-                print(f"Warning: Failed to load optimizer states: {e}")
-                print("Will initialize new optimizers")
+                import traceback
+                print(f"ERROR: Failed to load optimizer states from {optimizer_dir}")
+                print(f"ERROR TYPE: {type(e).__name__}")
+                print(f"ERROR MESSAGE: {str(e)}")
+                print("FULL TRACEBACK:")
+                traceback.print_exc()
+                raise
         else:
             print("Warning: No optimizer states found in checkpoint. Will initialize new optimizers.")
         
@@ -1536,7 +1708,13 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
                     metrics = json.load(f)
                 print(f"Loaded metrics from checkpoint")
             except Exception as e:
-                print(f"Warning: Failed to load metrics: {e}")
+                import traceback
+                print(f"ERROR: Failed to load metrics from {metrics_path}")
+                print(f"ERROR TYPE: {type(e).__name__}")
+                print(f"ERROR MESSAGE: {str(e)}")
+                print("FULL TRACEBACK:")
+                traceback.print_exc()
+                raise
         
         loaded_models["optimizer_states"] = optimizer_states
         loaded_models["metrics"] = metrics
@@ -1548,7 +1726,13 @@ def load_models_from_checkpoint(checkpoint_dir: str, config: AgentConfig, model_
         return loaded_models
         
     except Exception as e:
-        raise RuntimeError(f"Failed to load models from checkpoint {checkpoint_dir}: {e}")
+        import traceback
+        print(f"ERROR: Failed to load models from checkpoint {checkpoint_dir}")
+        print(f"ERROR TYPE: {type(e).__name__}")
+        print(f"ERROR MESSAGE: {str(e)}")
+        print("FULL TRACEBACK:")
+        traceback.print_exc()
+        raise
 
 
 def save_checkpoint(
@@ -1559,6 +1743,7 @@ def save_checkpoint(
     metrics: Dict[str, float],
     output_dir: str,
     is_final: bool = False,
+    is_best: bool = False,
     config: Optional[AgentConfig] = None,
     high_level_policy: Optional[Any] = None,
     v_high_critic: Optional[Any] = None
@@ -1574,12 +1759,16 @@ def save_checkpoint(
         metrics: Training metrics
         output_dir: Output directory
         is_final: Whether this is the final checkpoint
+        is_best: Whether this is the best-model window checkpoint
         config: Configuration to save (optional)
         high_level_policy: High-level policy to save (optional)
     """
-    checkpoint_dir = os.path.join(output_dir, f"checkpoint_{episode}")
-    if is_final:
+    if is_best:
+        checkpoint_dir = os.path.join(output_dir, "best_model")
+    elif is_final:
         checkpoint_dir = os.path.join(output_dir, "final_model")
+    else:
+        checkpoint_dir = os.path.join(output_dir, f"checkpoint_{episode}")
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -1654,9 +1843,13 @@ def main():
     try:
         train_agent(config)
     except Exception as e:
-        print(f"An error occurred: {e}")
+        import traceback
+        print(f"ERROR: Training failed")
+        print(f"ERROR TYPE: {type(e).__name__}")
+        print(f"ERROR MESSAGE: {str(e)}")
+        print("FULL TRACEBACK:")
         traceback.print_exc()
-        raise e
+        raise
     finally:
         print(f"Total execution time: {time.time() - start_time:.2f} seconds")
 

@@ -19,7 +19,7 @@ from transformers import (
 import os
 
 from src.base import Critic, ModelBase
-from src.utils import apply_activation_clamping
+from src.utils import apply_activation_clamping, disable_lora_adapters, get_transformer_module
 
 class AbstractValueCritic(ModelBase, Critic, ABC):
     """
@@ -48,8 +48,10 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
         # Use provided model instance
         self.model = model
             
-        # Freeze the base model parameters
-        for param in self.model.parameters():
+        # Freeze backbone only; LoRA adapter weights stay trainable for L2/L3 policies
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                continue
             param.requires_grad = False
             
         # Initialize the value head (to be defined by subclasses)
@@ -73,8 +75,7 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
         # ------------------------------------------------------------------
         # Memory optimisation for critics (b, c, d from user request)
         # b) Disable key-value cache to avoid storing past states we never reuse
-        if hasattr(self.model.config, "use_cache"):
-            self.model.config.use_cache = False
+        self.model.config.use_cache = False
 
         # c) Enable gradient checkpointing *only* when some base-model parameters
         #    are trainable.  When the backbone is entirely frozen (as in our
@@ -88,8 +89,7 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
                     raise RuntimeError("Base model does not support gradient checkpointing")
 
         # d) Use memory-efficient FlashAttention v2 when available.
-        if hasattr(self.model.config, "attn_implementation"):
-            self.model.config.attn_implementation = "flash_attention_2"
+        self.model.config.attn_implementation = "flash_attention_2"
         # ------------------------------------------------------------------
         
         # Set default forward hook configuration
@@ -174,26 +174,13 @@ class AbstractValueCritic(ModelBase, Critic, ABC):
             # MEMORY OPTIMIZATION: Create a custom forward pass that avoids loading the language model head
             # This prevents the massive memory allocation from the vocabulary projection
             def custom_forward(*args, **kwargs):
-                # Remove any logits-related arguments to prevent LM head computation
                 kwargs.pop('labels', None)
                 kwargs.pop('lm_labels', None)
-                
-                # Call the model's forward method but stop at hidden states
-                # We need to access the transformer layers directly to avoid the LM head
-                if hasattr(self.model, 'model'):
-                    # For models with a 'model' attribute (like LlamaForCausalLM)
-                    transformer_outputs = self.model.model(
+                with disable_lora_adapters(self.model):
+                    transformer_outputs = get_transformer_module(self.model)(
                         *args,
                         **kwargs
                     )
-                else:
-                    # For models without a 'model' attribute, try to access layers directly
-                    # This is a fallback and may not work for all model architectures
-                    transformer_outputs = self.model(
-                        *args,
-                        **kwargs
-                    )
-                
                 return transformer_outputs
             
             # Get model outputs with activation clamping
@@ -270,25 +257,65 @@ class SequenceLevelValueCritic(AbstractValueCritic):
     """
     
     def _init_value_head(self) -> None:
-        """Initialize sequence-level value head."""
+        """Initialize sequence-level value heads (Q_high and V_high)."""
         hidden_size = self.model.config.hidden_size
+        # Q_high head: operates on concatenated state+action pooled representation
         self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        # V_high head: operates on state-only pooled representation
+        self.state_value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
         
         # Initialize weights
-        for module in self.value_head.modules():
+        for module in list(self.value_head.modules()) + list(self.state_value_head.modules()):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        
+        # Ensure Q/V heads are trainable and match backbone dtype (bf16 training)
+        for param in self.value_head.parameters():
+            param.requires_grad = True
+        for param in self.state_value_head.parameters():
+            param.requires_grad = True
+        model_dtype = next(self.model.parameters()).dtype
+        self.value_head = self.value_head.to(dtype=model_dtype)
+        self.state_value_head = self.state_value_head.to(dtype=model_dtype)
+        # Polyak target heads (same architecture; bootstrap uses online backbone + target head)
+        import copy
+        self.target_state_value_head = copy.deepcopy(self.state_value_head)
+        self.target_value_head = copy.deepcopy(self.value_head)
+        for p in list(self.target_state_value_head.parameters()) + list(self.target_value_head.parameters()):
+            p.requires_grad = False
+        self._critic_target_steps = 0
     
     @property
     def is_token_level(self) -> bool:
         """This is not a token-level critic."""
         return False
+
+    def polyak_update_target_heads(self, tau: float = 0.005) -> None:
+        """Soft-update target V/Q heads toward online heads. tau=1.0 is hard-copy."""
+        if tau < 0.0 or tau > 1.0:
+            raise ValueError(f"critic polyak tau must be in [0, 1], got {tau}")
+        with torch.no_grad():
+            for online, target in (
+                (self.state_value_head, self.target_state_value_head),
+                (self.value_head, self.target_value_head),
+            ):
+                for op, tp in zip(online.parameters(), target.parameters()):
+                    tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
+        self._critic_target_steps += 1
+
+    def hard_update_target_heads(self) -> None:
+        """Hard-copy online heads into target heads."""
+        self.polyak_update_target_heads(tau=1.0)
     
     def _compute_values(self, 
                        hidden_states: torch.Tensor, 
@@ -314,6 +341,75 @@ class SequenceLevelValueCritic(AbstractValueCritic):
         values = values.to(dtype=model_dtype)
         
         return values
+
+    def v_value(self,
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                return_attention: bool = False,
+                requires_grad: bool = False,
+                return_last_hidden: bool = False,
+                use_target_head: bool = False,
+                **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Compute V_high(s) using the state-only V head.
+        Mirrors forward() but uses state_value_head and expects state-only tokens.
+
+        If use_target_head=True, applies the polyak target V head on backbone features
+        (no grad through the head; for TD bootstrap).
+        """
+        model_device = self.model.get_input_embeddings().weight.device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
+        value_head = self.target_state_value_head if use_target_head else self.state_value_head
+        value_head.to(model_device)
+        # Target head path never needs grads; online head respects requires_grad.
+        head_requires_grad = requires_grad and not use_target_head
+        with torch.set_grad_enabled(head_requires_grad):
+            def custom_forward(*args, **kwargs):
+                kwargs.pop('labels', None)
+                kwargs.pop('lm_labels', None)
+                transformer_outputs = self.model.model(
+                    *args,
+                    **kwargs
+                )
+                return transformer_outputs
+            outputs = apply_activation_clamping(
+                self.model,
+                custom_forward,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_attentions=return_attention,
+                return_dict=True,
+                enable_hooks=self.enable_forward_hooks,
+                clamp_range=self.forward_hook_clamp_range,
+                layernorm_range=self.forward_hook_layernorm_range,
+                use_cache=False,
+                attn_implementation="flash_attention_2",
+                **kwargs
+            )
+            hidden_states = outputs.hidden_states[-1]
+            hidden_states = hidden_states.detach()
+            if head_requires_grad:
+                hidden_states.requires_grad_(True)
+            # Mean pool across tokens in the state
+            pooled_hidden_states = hidden_states.mean(dim=1)
+            if use_target_head:
+                with torch.no_grad():
+                    values = value_head(pooled_hidden_states).squeeze(-1)
+            else:
+                values = value_head(pooled_hidden_states).squeeze(-1)
+            model_dtype = next(self.model.parameters()).dtype
+            values = values.to(dtype=model_dtype)
+            attentions = outputs.attentions if return_attention else None
+            last_hidden = hidden_states if return_last_hidden else None
+        if return_attention and return_last_hidden:
+            return values, attentions, last_hidden
+        if return_attention:
+            return values, attentions
+        if return_last_hidden:
+            return values, last_hidden
+        return values
     
     def save(self, save_path: str) -> None:
         """
@@ -323,8 +419,11 @@ class SequenceLevelValueCritic(AbstractValueCritic):
             save_path: Path to save the model to
         """
         os.makedirs(save_path, exist_ok=True)
-        torch.save(self.value_head.state_dict(), os.path.join(save_path, "sequence_value_head.pt"))
-        print(f"Saved sequence-level value head to {save_path}")
+        torch.save(self.value_head.state_dict(), os.path.join(save_path, "sequence_q_value_head.pt"))
+        torch.save(self.state_value_head.state_dict(), os.path.join(save_path, "sequence_v_value_head.pt"))
+        torch.save(self.target_value_head.state_dict(), os.path.join(save_path, "sequence_q_target_head.pt"))
+        torch.save(self.target_state_value_head.state_dict(), os.path.join(save_path, "sequence_v_target_head.pt"))
+        print(f"Saved sequence-level Q/V heads (incl. targets) to {save_path}")
         
     def load(self, load_path: str) -> None:
         """
@@ -335,18 +434,44 @@ class SequenceLevelValueCritic(AbstractValueCritic):
         """
         from src.utils import safe_load_state_dict
         
-        value_head_path = os.path.join(load_path, "sequence_value_head.pt")
-        if not os.path.exists(value_head_path):
+        q_head_path = os.path.join(load_path, "sequence_q_value_head.pt")
+        v_head_path = os.path.join(load_path, "sequence_v_value_head.pt")
+        if not os.path.exists(q_head_path):
             raise FileNotFoundError(
-                f"Sequence value head not found at {value_head_path}. This checkpoint is incomplete and cannot be used."
+                f"Sequence Q head not found at {q_head_path}. This checkpoint is incomplete and cannot be used."
             )
-            
-        state_dict = torch.load(value_head_path)
-        success, error = safe_load_state_dict(self.value_head, {"value_head": state_dict}, "value_head", strict=True)
+        if not os.path.exists(v_head_path):
+            raise FileNotFoundError(
+                f"Sequence V head not found at {v_head_path}. This checkpoint is incomplete and cannot be used."
+            )
+
+        q_state = torch.load(q_head_path)
+        success, error = safe_load_state_dict(self.value_head, {"value_head": q_state}, "value_head", strict=True)
         if not success:
             raise RuntimeError(error)
-            
-        print(f"Loaded sequence-level value head from {load_path}")
+        v_state = torch.load(v_head_path)
+        success, error = safe_load_state_dict(self.state_value_head, {"value_head": v_state}, "value_head", strict=True)
+        if not success:
+            raise RuntimeError(error)
+        # Target heads optional for older checkpoints: default to online copy
+        q_tgt_path = os.path.join(load_path, "sequence_q_target_head.pt")
+        v_tgt_path = os.path.join(load_path, "sequence_v_target_head.pt")
+        if os.path.exists(q_tgt_path) and os.path.exists(v_tgt_path):
+            q_tgt = torch.load(q_tgt_path)
+            success, error = safe_load_state_dict(
+                self.target_value_head, {"value_head": q_tgt}, "value_head", strict=True
+            )
+            if not success:
+                raise RuntimeError(error)
+            v_tgt = torch.load(v_tgt_path)
+            success, error = safe_load_state_dict(
+                self.target_state_value_head, {"value_head": v_tgt}, "value_head", strict=True
+            )
+            if not success:
+                raise RuntimeError(error)
+        else:
+            self.hard_update_target_heads()
+        print(f"Loaded sequence-level Q/V heads from {load_path}")
 
 
 class TokenLevelValueCritic(AbstractValueCritic):
@@ -537,18 +662,11 @@ class TokenLevelValueCriticV(AbstractValueCritic):
                 kwargs.pop('lm_labels', None)
                 
                 # Call the model's forward method but stop at hidden states
-                if hasattr(self.model, 'model'):
-                    # For models with a 'model' attribute (like LlamaForCausalLM)
-                    transformer_outputs = self.model.model(
-                        *args,
-                        **kwargs
-                    )
-                else:
-                    # For models without a 'model' attribute, try to access layers directly
-                    transformer_outputs = self.model(
-                        *args,
-                        **kwargs
-                    )
+                # For models with a 'model' attribute (like LlamaForCausalLM)
+                transformer_outputs = self.model.model(
+                    *args,
+                    **kwargs
+                )
                 
                 return transformer_outputs
             

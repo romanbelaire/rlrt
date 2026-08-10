@@ -1,0 +1,11 @@
+{
+  "templates": [
+    {
+      "id": "blank",
+      "template": "",
+      "type": "blank",
+      "instruction": ""
+    }
+  ],
+  "entropy_coef": 0.01
+}

@@ -1,0 +1,96 @@
+{
+  "system_prompt": "You are the generative component of a reasoning agent. Follow the instructions given, and treat the context as an object of analysis, rather than a task to complete. When an answer is desired, you will be asked directly to provide an option label (A, B, C, or D). Otherwise, engage in reasoning.",
+  "templates": [
+    {
+      "id": "mc_submit_answer",
+      "name": "Submit final answer",
+      "instruction": "Your job is to answer the question: {context} \n\n Options: {choices_text} \n\n CRITICAL: You must output EXACTLY ONE character - either A, B, C, or D. Based on your prior reasoning, the answer is:",
+      "template": "CRITICAL INSTRUCTION: You are submitting your final answer.\n\nContext: {context}\nEndings:\n{choices_text}\n\nBased on all reasoning above, your answer is:\n\n"
+    },
+    {
+      "id": "mc_reason",
+      "name": "Reason about the context",
+      "instruction": "Analyze the context and endings step by step. Identify key facts and constraints.",
+      "template": "Reason about the context:\n{context}\n\nEndings:\n{choices_text}\n\nProvide useful reasoning; do not give the final answer yet."
+    },
+    {
+      "id": "mc_examine_A",
+      "name": "Examine ending A",
+      "instruction": "Examine ending A in detail. What evidence supports or contradicts it? Is it a likely answer, and why?",
+      "template": "Examine ending {option_label}. What evidence supports or contradicts it, given the context? \nContext: {context}\nEnding {option_label}: {option_text}\nThoughts:"
+    },
+    {
+      "id": "mc_examine_B",
+      "name": "Examine ending B",
+      "instruction": "Examine ending B in detail. What evidence supports or contradicts it? Is it a likely answer, and why?",
+      "template": "Examine ending {option_label}. What evidence supports or contradicts it, given the context? \nContext: {context}\nEnding {option_label}: {option_text}\nThoughts:"
+    },
+    {
+      "id": "mc_examine_C",
+      "name": "Examine ending C",
+      "instruction": "Examine ending C in detail. What evidence supports or contradicts it? Is it a likely answer, and why?",
+      "template": "Examine ending {option_label}. What evidence supports or contradicts it, given the context? \nContext: {context}\nEnding {option_label}: {option_text}\nThoughts:"
+    },
+    {
+      "id": "mc_examine_D",
+      "name": "Examine ending D",
+      "instruction": "Examine ending D in detail. What evidence supports or contradicts it? Is it a likely answer, and why?",
+      "template": "Examine ending {option_label}. What evidence supports or contradicts it, given the context? \nContext: {context}\nEnding {option_label}: {option_text}\nThoughts:"
+    },
+    {
+      "id": "ct_purpose",
+      "name": "Purpose of the information",
+      "instruction": "Why are we given this information? What will we achieve by answering the question?",
+      "template": "Context: {context}\nWhy are we given this information? What will we achieve by answering the question?"
+    },
+    {
+      "id": "ct_question",
+      "name": "Question",
+      "instruction": "What is the issue we are trying to solve?",
+      "template": "Context: {context}\nWhat is the issue we are trying to solve?"
+    },
+    {
+      "id": "ct_information",
+      "name": "Information",
+      "instruction": "What information, data, and evidence are we given? Summarize the context that is relevant to the issue at hand.",
+      "template": "Context: {context}\nWhat information, data, and evidence are we given? Summarize the context that is relevant to the issue at hand."
+    },
+    {
+      "id": "ct_inferences",
+      "name": "Inference",
+      "instruction": "From the evidence provided, derive two plausible inferences. For each, provide the reasoning, and one piece of additional data that would most change your confidence.",
+      "template": "From the evidence provided, derive two plausible inferences. For each, provide the reasoning, and one piece of additional data that would most change your confidence. \nContext: {context}\nInferences:"
+    },
+    {
+      "id": "ct_assumptions",
+      "name": "Assumptions",
+      "instruction": "Identify the key assumptions underpinning your position. Mark each as justified or unjustified and propose a concrete test that could validate or falsify it.",
+      "template": "Context: {context}\nIdentify the key assumptions underpinning your position. Mark each as justified or unjustified and propose a concrete test that could validate or falsify it."
+    },
+    {
+      "id": "ct_concepts",
+      "name": "Concepts and theories",
+      "instruction": "Define the central concepts using standard sources. Note any nonstandard usage you adopt and why. Connect each concept to a relevant theory and its limits of applicability.",
+      "template": "Context: {context}\nDefine the central concepts using standard sources. Note any nonstandard usage you adopt and why. Connect each concept to a relevant theory and its limits of applicability."
+    },
+    {
+      "id": "ct_implications",
+      "name": "Implications and consequences",
+      "instruction": "If your current best answer were true, list one near‑term and one long‑term implication, including at least one unintended consequence for different stakeholders.",
+      "template": "Context: {context}\nIf your current best answer were true, list one near‑term and one long‑term implication, including at least one unintended consequence for different stakeholders."
+    },
+    {
+      "id": "ct_assess",
+      "name": "Assessing thinking",
+      "instruction": "Evaluate your reasoning for clarity, accuracy, precision, relevance, depth, breadth, and logical consistency.",
+      "template": "Context: {context}\nEvaluate your reasoning for clarity, accuracy, precision, relevance, depth, breadth, and logical consistency."
+    },
+    {
+      "id": "ct_humility",
+      "name": "Intellectual humility",
+      "instruction": "List what you don’t know, key uncertainties, and potential biases. Specify what evidence would make you change your mind, and how you would update your conclusion.",
+      "template": "Context: {context}\nList what you don’t know, key uncertainties, and potential biases. Specify what evidence would make you change your mind, and how you would update your conclusion."
+    }
+  ]
+}
+

@@ -13,7 +13,7 @@ import gc
 import warnings
 import time
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import torch.nn as nn
 
 # ===== Device Management Functions =====
@@ -67,6 +67,50 @@ def clear_gpu_memory() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+
+def _rmsnorm_forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """RMSNorm forward without fp32 upcast (keeps native weight/activation dtype)."""
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states
+
+
+@contextmanager
+def disable_lora_adapters(model: nn.Module):
+    """Run forward on the shared backbone with LoRA adapters disabled."""
+    if hasattr(model, "disable_adapter"):
+        with model.disable_adapter():
+            yield
+    else:
+        yield
+
+
+def get_transformer_module(model: nn.Module) -> nn.Module:
+    """Inner transformer stack (no LM head) for a causal LM or Peft-wrapped LM."""
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model().model
+    return model.model
+
+
+def patch_rmsnorm_forward_bf16(model: nn.Module) -> int:
+    """
+    Replace HuggingFace RMSNorm layers that upcast activations to float32.
+
+    MistralRMSNorm/LlamaRMSNorm call hidden_states.to(torch.float32) for variance
+    even when weights are bf16, doubling peak activation memory per layer.
+    """
+    import types
+
+    count = 0
+    for module in model.modules():
+        if type(module).__name__.endswith("RMSNorm"):
+            module.forward = types.MethodType(_rmsnorm_forward_bf16, module)
+            count += 1
+    if count:
+        print(f"Patched {count} RMSNorm modules to compute in native dtype (no fp32 upcast)")
+    return count
+
 
 def to_device(tensor: torch.Tensor, device: Optional[str] = None) -> torch.Tensor:
     """
@@ -288,6 +332,35 @@ def batch_encode(texts: List[str],
     )
     
     return {k: v.to(device) for k, v in encoding.items()} 
+
+
+def ensure_tokenizer_padding_settings(tokenizer):
+    """
+    Ensure a tokenizer has the correct padding settings for decoder-only models.
+    
+    Args:
+        tokenizer: Tokenizer instance to fix
+        
+    Returns:
+        The tokenizer with correct settings applied
+    """
+    if tokenizer is None:
+        return tokenizer
+        
+    # Set padding side to left for decoder-only models
+    tokenizer.padding_side = "left"
+    
+    # Ensure pad token is set
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            # Add pad token if needed
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    
+    return tokenizer
+
 
 # ===== Caching Utilities =====
 

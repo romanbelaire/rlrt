@@ -12,13 +12,11 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import os
-import deepspeed
 import uuid
 
 # ---------------------------------------------------------------------------
-# Ensure compiled Triton / DeepSpeed kernels are cached in scratch space so
-# agent models reuse them exactly like the environment models.  This must be
-# set *before* any call to deepspeed.init_inference() or Triton compilation.
+# Cache compiled Triton kernels in scratch space so agent models reuse them
+# exactly like the environment models. Set before Triton compilation.
 # ---------------------------------------------------------------------------
 
 import getpass
@@ -46,7 +44,6 @@ class ModelBase(nn.Module):
         self.base_model: Optional[PreTrainedModel] = None
         self.base_device: str = "cpu"
         self.compute_device: str = "cuda" if torch.cuda.is_available() else "cpu"
-        self.ds_engine = None  # DeepSpeed inference engine
         
     def to_device(self, device: str) -> None:
         """
@@ -55,9 +52,6 @@ class ModelBase(nn.Module):
         Args:
             device: Device to move the model to ("cpu", "cuda", "cuda:0", etc.)
         """
-        if self.ds_engine is not None:
-            raise RuntimeError("Model is using DeepSpeed. Device placement is managed by DeepSpeed.")
-
         previous_device = self.base_device
         self.base_device = device
         
@@ -236,9 +230,10 @@ class Conversation:
         self.metadata: Dict[str, Any] = {}
         self.high_level_instructions: List[str] = []
         self.template_ids: List[str] = []  # Track template ID for each user message
+        self.dialogue_step_numbers: List[int] = []  # Track step number for each dialogue turn
         self.original_harmful_prompt: Optional[str] = None
         
-    def add_user_message(self, message: str, high_level_instruction: Optional[str] = None, template_id: Optional[str] = None) -> None:
+    def add_user_message(self, message: str, high_level_instruction: Optional[str] = None, template_id: Optional[str] = None, step_number: Optional[int] = None) -> None:
         """
         Add a user message to the conversation.
         
@@ -246,14 +241,15 @@ class Conversation:
             message: The user's message
             high_level_instruction: The high-level instruction for this user message (optional)
             template_id: The template ID used for this user message (optional)
+            step_number: The dialogue step number for this message (optional)
         """
         self.user_messages.append(message)
         # Add corresponding high-level instruction (empty string if none provided)
-        instruction = high_level_instruction if high_level_instruction is not None else ""
-        self.high_level_instructions.append(instruction)
+        self.high_level_instructions.append(high_level_instruction or "")
         # Add corresponding template ID (empty string if none provided)
-        template_id_str = template_id if template_id is not None else ""
-        self.template_ids.append(template_id_str)
+        self.template_ids.append(template_id or "")
+        # Add corresponding step number (use current turn count if not provided)
+        self.dialogue_step_numbers.append(step_number if step_number is not None else len(self.user_messages) - 1)
         
     def add_assistant_message(self, message: str) -> None:
         """
@@ -551,6 +547,17 @@ class Conversation:
         if max_turns is not None:
             max_length = min(max_length, max_turns)
             
+        # Handle system prompt first (if it exists as the first assistant message)
+        if len(self.assistant_messages) > 0:
+            history.append({
+                'role': 'assistant',
+                'content': self.assistant_messages[0]
+            })
+            # Skip the first assistant message in the main loop
+            assistant_start_idx = 1
+        else:
+            assistant_start_idx = 0
+            
         for i in range(max_length):
             if i < len(self.user_messages):
                 history.append({
@@ -558,10 +565,10 @@ class Conversation:
                     'content': self.user_messages[i]
                 })
                 
-            if i < len(self.assistant_messages):
+            if i + assistant_start_idx < len(self.assistant_messages):
                 history.append({
                     'role': 'assistant', 
-                    'content': self.assistant_messages[i]
+                    'content': self.assistant_messages[i + assistant_start_idx]
                 })
                 
         return history
@@ -865,7 +872,7 @@ class BaseModelSingleton:
     _instances = {}
     
     @classmethod
-    def get_instance(cls, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, ds_config=None, prefer_gpu=None, quantize=None, instance_tag: str = None):
+    def get_instance(cls, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, prefer_gpu=None, quantize=None, instance_tag: str = None):
         """
         Get or create a singleton instance for the given model.
         
@@ -875,7 +882,6 @@ class BaseModelSingleton:
             use_offloading: Whether to use CPU offloading
             tokenizer: Tokenizer to use (can be None for delayed initialization)
             config: Model configuration
-            ds_config: DeepSpeed configuration
             prefer_gpu: Preferred GPU index (0, 1, etc.) or None for auto placement
             quantize: Quantization setting (False, 4, or 8) - overrides training mixed_precision
             instance_tag: Optional tag to distinguish instances sharing the same model_name (e.g., 'agent', 'critic')
@@ -891,7 +897,6 @@ class BaseModelSingleton:
                 use_offloading=use_offloading,
                 tokenizer=tokenizer,
                 config=config,
-                ds_config=ds_config,
                 prefer_gpu=prefer_gpu,
                 quantize=quantize
             )
@@ -899,42 +904,14 @@ class BaseModelSingleton:
     
     def _get_device_map_strategy(self):
         """
-        Determine device map strategy based on configuration and available GPUs.
-        
-        Strategy: GPU 0 for agent training, GPU 1 for inference models (target + guard)
+        Device map is disabled - always return None for single-device placement.
         
         Returns:
-            Device map for model loading
+            None (always)
         """
-        if self.use_offloading:
-            return None  # CPU offloading mode
-        
-        # Respect config flag: only enable device_map when explicitly requested
-        cfg_enable = False
-        if self.config is not None and hasattr(self.config, "model"):
-            cfg_enable = bool(getattr(self.config.model, "enable_device_map", False))
-        if not cfg_enable:
-            return None
-        
-        if not torch.cuda.is_available():
-            return "cpu"
-        
-        num_gpus = torch.cuda.device_count()
-        
-        if num_gpus == 1:
-            return "auto"
-        
-        # Multi-GPU setup with explicit targeting
-        if self.prefer_gpu is not None and self.prefer_gpu < num_gpus:
-            print(f"BaseModelSingleton: targeting {self.model_name} for GPU {self.prefer_gpu}")
-            # Place the entire model on the preferred GPU by returning an explicit device map.
-            # Using a dict avoids implicit defaulting to GPU 0 that occurs when a string like
-            # "cuda:1" is passed to `device_map`.
-            return {"": self.prefer_gpu}
-        else:
-            return "auto"
+        return None
 
-    def __init__(self, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, ds_config=None, prefer_gpu=None, quantize=None):
+    def __init__(self, model_name, hf_token=None, use_offloading=False, tokenizer=None, config=None, prefer_gpu=None, quantize=None):
         """
         Initialize the singleton. Should not be called directly.
         Use get_instance() instead.
@@ -945,7 +922,6 @@ class BaseModelSingleton:
             use_offloading: Whether to use CPU offloading
             tokenizer: Tokenizer to use (can be None for delayed initialization)
             config: Model configuration
-            ds_config: DeepSpeed configuration
             prefer_gpu: Preferred GPU index or None for auto placement
             quantize: Quantization setting (False, 4, or 8) - overrides training mixed_precision
         """
@@ -954,19 +930,23 @@ class BaseModelSingleton:
         self.use_offloading = use_offloading
         self.tokenizer = tokenizer
         self.config = config
-        self.ds_config = ds_config
         self.prefer_gpu = prefer_gpu
         self.quantize = quantize
         self.base_model = None
-        self.ds_engine = None
+        self.backbone = None
         self.peft_model = None
         self.available_adapters = {}
         self.active_adapter = None
         self.initialized = False
         self.initialize()
+
+    @property
+    def shared_model(self):
+        """Single loaded causal LM (Peft-wrapped when LoRA is enabled)."""
+        return self.peft_model if self.peft_model is not None else self.backbone
     
     def initialize(self):
-        """Initialize the model with DeepSpeed if configured."""
+        """Initialize the model."""
         print(f"Initializing BaseModelSingleton with model: {self.model_name}")
         
         # Load the model with memory-aware settings
@@ -991,8 +971,8 @@ class BaseModelSingleton:
         else:
             # Fall back to training mixed_precision setting
             precision = "fp16"
-            if self.config is not None and hasattr(self.config, "training"):
-                prec_field = getattr(self.config.training, "mixed_precision", None)
+            if self.config is not None:
+                prec_field = self.config.training.mixed_precision
                 if prec_field:
                     precision = str(prec_field).lower()
             if precision == "bf16":
@@ -1006,17 +986,17 @@ class BaseModelSingleton:
 
         # 2) Build max_memory map if specified in config
         max_memory = None
-        if self.config is not None and hasattr(self.config, "training"):
+        if self.config is not None:
             train_cfg = self.config.training
-            if getattr(train_cfg, "max_gpu_memory", None):
+            if train_cfg.max_gpu_memory:
                 max_memory = {}
                 if torch.cuda.is_available():
                     n_visible = torch.cuda.device_count()
-                    n_gpus_cfg = getattr(train_cfg, "num_gpus", n_visible)
+                    n_gpus_cfg = train_cfg.num_gpus if train_cfg.num_gpus else n_visible
                     for i in range(min(n_visible, n_gpus_cfg)):
                         max_memory[i] = train_cfg.max_gpu_memory
                 # Always include a CPU fallback
-                max_memory["cpu"] = getattr(train_cfg, "max_cpu_memory", "60GiB")
+                max_memory["cpu"] = train_cfg.max_cpu_memory if train_cfg.max_cpu_memory else "60GiB"
 
         # 3) Determine device map strategy
         device_map = self._get_device_map_strategy()
@@ -1037,14 +1017,7 @@ class BaseModelSingleton:
             'low_cpu_mem_usage': True,
             'trust_remote_code': True
         }
-        if device_map is not None:
-            model_kwargs['device_map'] = device_map
-            # Build max_memory map if specified in config
-            if max_memory is not None:
-                model_kwargs['max_memory'] = max_memory
-        else:
-            # No device_map: fall back to single-device placement later
-            pass
+        # device_map is always None - models will be placed on a single device
         
         # Add quantization config if specified
         if self.quantize == 4:
@@ -1067,62 +1040,36 @@ class BaseModelSingleton:
         # Ensure model is in bf16 for consistency (but skip if using bitsandbytes quantization)
         if torch_dtype == torch.bfloat16 and self.quantize not in [4, 8]:
             self.base_model = self.base_model.to(dtype=torch.bfloat16)
+
+        if torch_dtype == torch.bfloat16:
+            from src.utils import patch_rmsnorm_forward_bf16
+            patch_rmsnorm_forward_bf16(self.base_model)
         
-        # If device_map is disabled, move entire model to a single compute device
-        if device_map is None:
-            if torch.cuda.is_available():
-                target_device = "cuda:0"
+        # Move entire model to a single compute device
+        if torch.cuda.is_available():
+            # Respect prefer_gpu for device selection
+            if self.prefer_gpu is not None and self.prefer_gpu < torch.cuda.device_count():
+                target_device = f"cuda:{self.prefer_gpu}"
+                print(f"BaseModelSingleton: placing {self.model_name} on {target_device} (prefer_gpu={self.prefer_gpu})")
             else:
-                target_device = "cpu"
-            self.base_model.to(target_device)
+                target_device = "cuda:0"
+        else:
+            target_device = "cpu"
+        self.base_model.to(target_device)
         
         # Log device placement information
-        if hasattr(self.base_model, 'hf_device_map'):
-            print(f"BaseModelSingleton {self.model_name} device placement: {self.base_model.hf_device_map}")
-        else:
-            try:
-                device = next(self.base_model.parameters()).device
-                print(f"BaseModelSingleton {self.model_name} placed on device: {device}")
-            except StopIteration:
-                print(f"BaseModelSingleton {self.model_name} has no parameters to check device placement")
-        
-        # ------------------------------------------------------------------
-        # DeepSpeed inference wrapper (optional)
-        # ------------------------------------------------------------------
-        if self.ds_config is not None:
-            print("Initializing DeepSpeed inference engine...")
-            # Use the supplied ds_config; if it is a path load the JSON
-            ds_cfg = self.ds_config
-            if isinstance(ds_cfg, str) and os.path.exists(ds_cfg):
-                import json
-                with open(ds_cfg, "r") as f:
-                    ds_cfg = json.load(f)
-            # Ensure dtype aligns with precision settings if not explicitly set
-            ds_cfg.setdefault("dtype", precision)
-            self.ds_engine = deepspeed.init_inference(
-                model=self.base_model,
-                config=ds_cfg,
-                replace_with_kernel_inject=True
-            )
-            # Expose the underlying module so downstream code can call .generate()
-            self.base_model = self.ds_engine.module
-            print("DeepSpeed initialization complete")
-        
-            # --------------------------------------------------------------
-            # One-time warm-up to trigger Flash-Attention / Triton kernel
-            # compilation.  Outputs are cached in the directories above, so
-            # subsequent processes skip this cost.
-            # --------------------------------------------------------------
-            if torch.cuda.is_available():
-                with torch.no_grad():
-                    dummy = torch.tensor([[self.base_model.config.bos_token_id or 1]], device="cuda")
-                    _ = self.base_model.generate(dummy, max_new_tokens=1)
-        
-        # Track device assignments
-        self.devices = {}  # Maps component names to devices
-        self.devices["model"] = "deepspeed_managed" if self.ds_engine else "cuda" if torch.cuda.is_available() else "cpu"
-        
-        print(f"Model loaded with DeepSpeed inference engine")
+        try:
+            device = next(self.base_model.parameters()).device
+            print(f"BaseModelSingleton {self.model_name} placed on device: {device}", flush=True)
+        except StopIteration:
+            print(f"BaseModelSingleton {self.model_name} has no parameters to check device placement", flush=True)
+
+        # Skip one-token generate warmup: it can hang for minutes/hours on some
+        # GPU+flash-attn combos (observed on L40) and is not required for correctness.
+        print(f"BaseModelSingleton {self.model_name}: skipping generate warmup", flush=True)
+
+        self.devices = {}
+        self.devices["model"] = target_device
         
         # Now load tokenizer if provided
         if self.tokenizer is not None:
@@ -1133,26 +1080,18 @@ class BaseModelSingleton:
                 
             # Ensure tokenizer has proper padding settings
             if self.tokenizer:
-                self.tokenizer.padding_side = "left"
-                if self.tokenizer.pad_token is None:
-                    if self.tokenizer.eos_token is not None:
-                        self.tokenizer.pad_token = self.tokenizer.eos_token
-                        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                    else:
-                        # Add pad token if needed
-                        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                from src.utils import ensure_tokenizer_padding_settings
+                self.tokenizer = ensure_tokenizer_padding_settings(self.tokenizer)
         
-        # Ensure num_heads and rope_theta are set on attention modules for DeepSpeed compatibility
-        if hasattr(self.base_model, 'model'):
+        # Llama/Gemma attention modules may lack num_heads/rope_theta on some checkpoints.
+        if model_config.model_type in ("llama", "gemma"):
             for layer in self.base_model.model.layers:
-                if hasattr(layer, 'self_attn'):
-                    # Set num_heads if not present
-                    if not hasattr(layer.self_attn, 'num_heads'):
-                        layer.self_attn.num_heads = model_config.num_attention_heads
-                    # Set rope_theta if not present
-                    if not hasattr(layer.self_attn, 'rope_theta'):
-                        layer.self_attn.rope_theta = 10000.0  # Default from Llama implementation
+                if not hasattr(layer.self_attn, 'num_heads'):
+                    layer.self_attn.num_heads = model_config.num_attention_heads
+                if not hasattr(layer.self_attn, 'rope_theta'):
+                    layer.self_attn.rope_theta = 10000.0
         
+        self.backbone = self.base_model
         self.initialized = True
         return self.base_model, self.tokenizer
 
@@ -1173,9 +1112,8 @@ class BaseModelSingleton:
         from utils import create_lora_config
 
         target_layers_cfg = None
-        if hasattr(config, 'target_layers') and config.target_layers is not None:
-            if (-1 not in config.target_layers):
-                target_layers_cfg = config.target_layers
+        if config.target_layers is not None and -1 not in config.target_layers:
+            target_layers_cfg = config.target_layers
 
         lora_config = create_lora_config(
             lora_r=config.lora_r,
@@ -1186,8 +1124,8 @@ class BaseModelSingleton:
             bias="none"
         )
         
-        # Create PEFT model
-        self.peft_model = get_peft_model(self.base_model, lora_config)
+        # Create PEFT model on the single shared backbone (no second weight copy)
+        self.peft_model = get_peft_model(self.backbone, lora_config)
         self.available_adapters = {"base_model": True}
         self.active_adapter = "base_model"
         for n, p in self.peft_model.named_parameters():
@@ -1197,7 +1135,7 @@ class BaseModelSingleton:
                 p.requires_grad = False
         
         # If adapter path is provided, load weights
-        if hasattr(config, 'adapter_path') and config.adapter_path:
+        if config.adapter_path:
             self.peft_model.load_adapter(config.adapter_path, adapter_name="base_model")
         
         # Update base model reference
@@ -1208,10 +1146,6 @@ class BaseModelSingleton:
 
     def to_appropriate_devices(self):
         """Move models to appropriate devices based on configuration."""
-        if self.ds_engine is not None:
-            # DeepSpeed manages device placement
-            return
-            
         if self.use_offloading:
             # Move to CPU if offloading is enabled
             self.to("cpu")
@@ -1247,9 +1181,19 @@ class BaseModelSingleton:
         lora_config = None
         
         # Check if config is a ModelConfig object
-        if 'use_lora' in dir(config) and config.use_lora:
+        if hasattr(config, 'use_lora') and config.use_lora:
             # Create LoRA config from ModelConfig
             print(f"Creating LoRA config from ModelConfig")
+            lora_config = create_lora_config(
+                lora_r=config.lora_r,
+                lora_alpha=config.lora_alpha,
+                lora_dropout=config.lora_dropout,
+                target_modules=config.target_modules,
+                target_layers=config.target_layers
+            )
+        elif hasattr(config, 'target_modules') and hasattr(config, 'target_layers'):
+            # Handle dataclass-like config objects (e.g., HighLevelLoRAConfig)
+            print(f"Creating LoRA config from dataclass-like object")
             lora_config = create_lora_config(
                 lora_r=config.lora_r,
                 lora_alpha=config.lora_alpha,
@@ -1315,28 +1259,7 @@ class BaseModelSingleton:
         
         # Record the new adapter
         self.available_adapters[adapter_name] = True
-        
-        # Initialize DeepSpeed for the PEFT model
-        ds_config = {
-            "dtype": str(self.ds_engine.module.dtype).split('.')[-1],
-            "tensor_parallel": {"tp_size": 1},  # Single GPU for now
-            "replace_with_kernel_inject": True,
-            "enable_cuda_graph": False
-        }
-        
-        # Only add offload_param if we want to offload to CPU
-        if self.use_offloading:
-            ds_config["offload_param"] = "cpu"
-        
-        # Initialize DeepSpeed-Inference engine for PEFT model
-        self.ds_engine = deepspeed.init_inference(
-            self.peft_model,
-            config=ds_config,
-        )
-        
-        # Update PEFT model reference
-        self.peft_model = self.ds_engine.module
-        
+
         # Print adapters after addition
         print(f"Available adapters after addition: {list(self.available_adapters.keys())}")
         print(f"Active adapter: {self.active_adapter}")
@@ -1365,32 +1288,8 @@ class BaseModelSingleton:
             print(f"Adapter {adapter_name} is already active")
             return True
             
-        # Set the active adapter
         self.peft_model.set_adapter(adapter_name)
         self.active_adapter = adapter_name
-        
-        # Reinitialize DeepSpeed with the new adapter
-        ds_config = {
-            "dtype": str(self.ds_engine.module.dtype).split('.')[-1],
-            "tensor_parallel": {"tp_size": 1},  # Single GPU for now
-            "replace_with_kernel_inject": True,
-            "enable_cuda_graph": False
-        }
-        
-        # Only add offload_param if we want to offload to CPU
-        if self.use_offloading:
-            ds_config["offload_param"] = "cpu"
-        
-        # Initialize DeepSpeed-Inference engine for the new adapter
-        self.ds_engine = deepspeed.init_inference(
-            self.peft_model,
-            config=ds_config,
-            replace_with_kernel_inject=True
-        )
-        
-        # Update PEFT model reference
-        self.peft_model = self.ds_engine.module
-        
         print(f"Switched to adapter: {adapter_name}")
         return True
     
@@ -1411,31 +1310,8 @@ class BaseModelSingleton:
         print(f"Merging adapter {self.active_adapter} into base model")
         self.peft_model.merge_adapter()
         
-        # Reset to base model
         self.base_model = self.peft_model.get_base_model()
-        
-        # Reinitialize DeepSpeed with the merged model
-        ds_config = {
-            "dtype": str(self.ds_engine.module.dtype).split('.')[-1],
-            "tensor_parallel": {"tp_size": 1},  # Single GPU for now
-            "replace_with_kernel_inject": True,
-            "enable_cuda_graph": False
-        }
-        
-        # Only add offload_param if we want to offload to CPU
-        if self.use_offloading:
-            ds_config["offload_param"] = "cpu"
-        
-        # Initialize DeepSpeed-Inference engine for merged model
-        self.ds_engine = deepspeed.init_inference(
-            self.base_model,
-            config=ds_config,
-            replace_with_kernel_inject=True
-        )
-        
-        # Update base model reference
-        self.base_model = self.ds_engine.module
-        
+
         # Clear PEFT model
         self.peft_model = None
         self.active_adapter = None
@@ -1453,16 +1329,10 @@ class BaseModelSingleton:
         # First check if we have references to models
         has_base_model = 'base_model' in self.__dict__ and self.base_model is not None
         has_peft_model = 'peft_model' in self.__dict__ and self.peft_model is not None
-        has_ds_engine = 'ds_engine' in self.__dict__ and self.ds_engine is not None
         
-        if has_base_model or has_peft_model or has_ds_engine:
+        if has_base_model or has_peft_model:
             print("Unloading model and freeing memory...")
-            
-            # Clean up DeepSpeed engine
-            if has_ds_engine:
-                del self.ds_engine
-                self.ds_engine = None
-            
+
             # For PEFT models, we need to handle references differently
             if has_peft_model:
                 self.peft_model = None

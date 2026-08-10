@@ -1,0 +1,56 @@
+{
+  "training": {
+    "lr": 0.0005,
+    "value_lr": 0.0005,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip": 0.1,
+    "eps": 0.2,
+    "batch_size": 32,
+    "minibatch_size": 32,
+    "rollout_steps": 256,
+    "episodes": 200,
+    "use_per_token_advantages": true,
+    "debug_mode": false,
+    "enable_model_swapping": false,
+    "use_rs_minus_ra_reward": false,
+    "actor_max_chunk_size": 64,
+    "critic_max_chunk_size": 64,
+    "output_dir": "outputs/general_hellaswag_multiturn",
+    "entropy_coef": 0.001,
+    "kl_coef": 0.1
+  },
+  "model": {
+    "hf_checkpoint": "meta-llama/Llama-3.1-8B-Instruct",
+    "target_model": "meta-llama/Llama-3.2-1B-Instruct",
+    "use_lora": true,
+    "lora_r": 8,
+    "lora_alpha": 8,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj"
+    ],
+    "target_layers": [0, 1, 2, 3, 4, 5, 6, 7],
+    "use_high_level_policy": true,
+    "high_level_policy_type": "ppo",
+    "templates_path": "src/configs/templates_general_hellaswag.json"
+  },
+  "environment": {
+    "use_mcq_env": false,
+    "batch_size": 32,
+    "env_task": "mc_multiturn",
+    "max_new_tokens": 200,
+    "judge_batch_size": 128,
+    "target_quantize": false,
+    "guard_quantize": false,
+    "lmrl_options": {
+      "dataset_id": "Rowan/hellaswag",
+      "subset": null,
+      "split": "validation",
+      "shuffle": true,
+      "max_examples": 10000,
+      "max_turns": 10
+    }
+  }
+} 

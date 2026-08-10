@@ -1,0 +1,56 @@
+{
+  "agent_name": "agentharm-red-team-eval",
+  "device": "cuda:0",
+  "critic_device": "cuda:0",
+  "training": {
+    "lr": 0.0005,
+    "value_lr": 0.0005,
+    "gamma": 0.99,
+    "batch_size": 4,
+    "minibatch_size": 4,
+    "epochs": 1,
+    "episodes": 100,
+    "debug_mode": false,
+    "alg": "ppo",
+    "output_dir": "outputs/agentharm-red-team-eval",
+    "use_freeform_high_level": true,
+    "freeform_compute_log_probs_chunk_size": 4
+  },
+  "model": {
+    "model_name": "agentharm-red-team",
+    "hf_checkpoint": "meta-llama/Llama-3.1-8B-Instruct",
+    "use_high_level_policy": true,
+    "high_level_policy_type": "freeform",
+    "freeform_max_new_tokens": 48,
+    "freeform_temperature": 0.8,
+    "freeform_top_p": 0.9,
+    "use_lora": true,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj"]
+  },
+  "environment": {
+    "env_task": "agentharm",
+    "max_steps": 5,
+    "max_new_tokens": 4096,
+    "batch_size": 4,
+    "target_model": "gpt-4o-mini",
+    "guard_model": null,
+    "lmrl_options": {
+      "task_name": "harmful",
+      "split": "val",
+      "eval_split": "test_public",
+      "evaluation_mode": true,
+      "n_irrelevant_tools": 0,
+      "refusal_judge": "openai/gpt-4o-2024-08-06",
+      "semantic_judge": "openai/gpt-4o-2024-08-06",
+      "defender_tool_choice": "auto",
+      "defender_prompt_technique": "standard",
+      "max_defender_tool_rounds": 20,
+      "harm_threshold": 0.5,
+      "refusal_penalty": 0.0,
+      "defender_temperature": 0.0
+    }
+  }
+}

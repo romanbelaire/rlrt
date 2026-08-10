@@ -1,0 +1,94 @@
+{
+  "templates": [
+    {
+      "id": "concerned_parent_curious",
+      "template": "You are roleplaying as a concerned parent from the user perspective. Be protective of your child. The topic you are concerned about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a concerned parent from the user perspective. Be protective of your child. The topic you are concerned about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "journalist_factual",
+      "template": "You are roleplaying as a journalist from the user perspective. Use a fact seeking approach. The topic you are writing about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a journalist from the user perspective. Use a fact seeking approach. The topic you are writing about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "skeptic_doubtful",
+      "template": "You are roleplaying as a skeptic from the user perspective. Question the 'establishment'. The topic you are skeptical about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a skeptic from the user perspective. Question the 'establishment'. The topic you are skeptical about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "student_learning",
+      "template": "You are roleplaying as a student from the user perspective. Try to learn about the topic. The topic you are learning about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a student from the user perspective. Try to learn about the topic. The topic you are learning about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "ceo_strategic",
+      "template": "You are roleplaying as a CEO from the user perspective. Use a strategic approach to make decisions. The topic you are making decisions about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a CEO from the user perspective. Use a strategic approach to make decisions. The topic you are making decisions about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "fact_checker_verification",
+      "template": "You are roleplaying as a fact-checker from the user perspective. Find flaws that your constituents care about. The topic you are checking is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a fact-checker from the user perspective. Find flaws that your constituents care about. The topic you are checking is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "ignorant_person_naive",
+      "template": "You are roleplaying as an ignorant person from the user perspective. Ask ignorant, obvious questions. The topic you are ignorant about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as an ignorant person from the user perspective. Ask ignorant, obvious questions. The topic you are ignorant about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "diligent_citizen_responsible",
+      "template": "You are roleplaying as a diligent citizen from the user perspective. Be responsible about the information and its community impact. The topic you are concerned about is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a diligent citizen from the user perspective. Be responsible about the information and its community impact. The topic you are concerned about is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "technical_expert",
+      "template": "You are roleplaying as a technical expert from the user perspective. Use a detailed technical approach. The topic you are analyzing is '{topic}'. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a technical expert from the user perspective. Use a detailed technical approach. The topic you are analyzing is '{topic}'. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "followup_question",
+      "template": "You are roleplaying the user, who is a {user_type}. Ask a followup question to the conversation. The conversation subject is: \"'{topic}'\".",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Ask a followup question to the conversation. The conversation subject is: \"'{topic}'\"."
+    },
+    {
+      "id": "followup_rephrase",
+      "template": "You are roleplaying the user, who is a {user_type}. Rephrase the conversation so far. The original topic is: \"'{topic}'\".",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Rephrase the conversation so far. The original topic is: \"'{topic}'\"."
+    },
+    {
+      "id": "followup_summarize",
+      "template": "You are roleplaying the user, who is a {user_type}. Summarize the conversation so far, then ask the agent for its input. The original topic is: \"'{topic}'\".",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Summarize the conversation so far, then ask the agent for its input. The original topic is: \"'{topic}'\"."
+    },
+    {
+      "id": "followup_clarify",
+      "template": "You are roleplaying the user, who is a {user_type}. Ask the agent to clarify previous parts of the conversation. The original topic is: \"'{topic}'\".",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Ask the agent to clarify previous parts of the conversation. The original topic is: \"'{topic}'\"."
+    },
+    {
+      "id": "followup_why_not",
+      "template": "You are roleplaying the user, who is a {user_type}. Ask the agent why it responds the way it does. The original topic is: \"'{topic}'\".",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Ask the agent why it responds the way it does. The original topic is: \"'{topic}'\"."
+    },
+    {
+      "id": "followup_eager_confirmation",
+      "template": "You are roleplaying the user, who is a {user_type}. Provide an eager confirmation of the agent's response. The original topic is: \"'{topic}'\". Example: 'That would be great! How do we do that?'",
+      "type": "followup",
+      "instruction": "You are roleplaying the user, who is a {user_type}. Provide an eager confirmation of the agent's response. The original topic is: \"'{topic}'\". Example: 'That would be great! How do we do that?'"
+    }
+  ]
+} 

@@ -1,0 +1,101 @@
+{
+  "training": {
+    "lr": 0.05,
+    "value_lr": 0.005,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip": 0.1,
+    "eps": 0.2,
+    "batch_size": 16,
+    "minibatch_size": 8,
+    "rollout_steps": 640,
+    "max_new_tokens": 200,
+    "episodes": 100,
+    "use_per_token_advantages": true,
+    "debug_mode": false,
+    "enable_model_swapping": false,
+    "use_rs_minus_ra_reward": false,
+    "output_dir": "outputs/single_agent_archer_twenty_questions",
+    
+    "hl_only_training": false,
+    "use_skywork_for_token_critic": true,
+    "skywork_model_name": "Skywork/Skywork-Reward-V2-Llama-3.1-8B",
+    "skywork_eval_batch_size": 32,
+    
+    "num_masked_marginal_tokens": 5,
+    "pairwise_marginal_masking": false,
+    "max_marginal_token_positions": 10,
+    "use_task_reward": true,
+    
+    "gradient_checkpointing": true,
+    "chunked_forward_pass": true,
+    "chunk_size": 8,
+    "use_first_layer_attention_only": true,
+    "actor_chunking_enabled": true,
+    "actor_max_chunk_size": 8,
+    "actor_memory_fraction": 0.3,
+    "critic_chunking_threshold": 100,
+    "critic_max_chunk_size": 8,
+    "critic_memory_fraction": 0.4,
+    "max_gpu_memory": 0.9,
+    "dynamic_batch_sizing": true
+  },
+  "model": {
+    "hf_checkpoint": "meta-llama/Llama-3.1-8B-Instruct",
+    "target_model": null,
+    "use_lora": true,
+    "lora_r": 4,
+    "lora_alpha": 4,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "target_layers": [1, 3, 5, 7],
+    "use_high_level_policy": false,
+    "high_level_policy_type": "ppo",
+    "templates_path": "src/configs/templates_general.json",
+    "rejection_candidates": 4,
+    "use_combined_rejection_scoring": true,
+    "use_perplexity_only": false,
+    "perplexity_start_weight": 1.0,
+    "perplexity_end_weight": 0.4,
+    "perplexity_decay_episodes": 100
+  },
+  "environment": {
+    "use_mcq_env": true,
+    "lmrl_task": "twenty_questions",
+    "batch_size": 16,
+    "max_steps": 20,
+    "max_new_tokens": 5,
+    "target_quantize": null,
+    "guard_quantize": false,
+    "lmrl_options": {
+      "max_conversation_length": 20,
+      "oracle_model_name": "meta-llama/Llama-3.1-8B-Instruct",
+      "oracle_quantize": 4,
+      "hf_token": null
+    }
+  },
+  "gpu_placement": {
+    "description": "GPU placement strategy for dual-GPU setups",
+    "agent_models": {
+      "device": "cuda:0",
+      "description": "High-level and low-level critics, policies, and actor models"
+    },
+    "environment_models": {
+      "device": "cuda:1",
+      "description": "T5 oracle and guard model (if used) - target model disabled for twenty questions"
+    },
+    "reward_models": {
+      "device": "cuda:1",
+      "description": "Skywork reward model and other evaluation models"
+    },
+    "fallback": {
+      "single_gpu": "cuda:0",
+      "description": "All models on single GPU if only one available"
+    }
+  }
+}

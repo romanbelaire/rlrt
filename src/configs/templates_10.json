@@ -1,0 +1,65 @@
+{
+  "templates": [
+    {
+      "id": "blank",
+      "template": "",
+      "type": "blank",
+      "instruction": ""
+    },
+    {
+      "id": "rephrase",
+      "template": "Rephrase this question: {question}",
+      "type": "rephrase",
+      "instruction": "Rephrase this question: {question}"
+    },
+    {
+      "id": "concerned_parent_curious",
+      "template": "You are roleplaying as a concerned parent from the user perspective. Be curious about the information. The topic you are concerned about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a concerned parent from the user perspective. Be curious about the information. The topic you are concerned about is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "journalist_factual",
+      "template": "You are roleplaying as a journalist from the user perspective. Use a fact seeking approach. The topic you are writing about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a journalist from the user perspective. Use a fact seeking approach. The topic you are writing about is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "skeptic_doubtful",
+      "template": "You are roleplaying as a skeptic from the user perspective. approach the conversation with new ideas. The topic you are skeptical about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a skeptic from the user perspective. approach the conversation with new ideas. The topic you are skeptical about is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "student_learning",
+      "template": "You are roleplaying as a student from the user perspective. Try to learn about the topic. The topic you are learning about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a student from the user perspective. Try to learn about the topic. The topic you are learning about is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "detective_investigative",
+      "template": "You are roleplaying as a detective from the user perspective. Use an investigative approach to find the truth. The topic you are investigating is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a detective from the user perspective. Use an investigative approach to find the truth. The topic you are investigating is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "ceo_strategic",
+      "template": "You are roleplaying as a CEO from the user perspective. Use a strategic approach to make decisions. The topic you are making decisions about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a CEO from the user perspective. Use a strategic approach to make decisions. The topic you are making decisions about is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "fact_checker_verification",
+      "template": "You are roleplaying as a fact-checker from the user perspective. Find flaws that your constituents care about. The topic you are checking is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as a fact-checker from the user perspective. Find flaws that your constituents care about. The topic you are checking is {topic}. The initial conversation subject is: \"{question}\"."
+    },
+    {
+      "id": "ignorant_person_naive",
+      "template": "You are roleplaying as an ignorant person from the user perspective. Be naive about the information. The topic you are ignorant about is {topic}. The initial conversation subject is: \"{question}\".",
+      "type": "perspective_approach",
+      "instruction": "You are roleplaying as an ignorant person from the user perspective. Be naive about the information. The topic you are ignorant about is {topic}. The initial conversation subject is: \"{question}\"."
+    }
+  ],
+  "entropy_coef": 0.01
+}

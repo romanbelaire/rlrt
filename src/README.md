@@ -30,19 +30,19 @@ This directory contains the refactored source code for the reinforcement learnin
 To train an agent using a configuration file:
 
 ```bash
-python src/main.py --train --config_path src/configs/sample_config.json
+python src/main.py --config_path src/configs/sample_config.json
 ```
 
-To test an agent:
+To test an agent using the test runner:
 
 ```bash
-python src/main.py --test --config_path src/configs/sample_config.json
+python -m src.test_runner --config-path src/configs/sample_config.json --checkpoint-dir path/to/checkpoint
 ```
 
 You can override specific configuration values via command line arguments:
 
 ```bash
-python src/main.py --train --config_path src/configs/sample_config.json --learning_rate 5e-5 --batch_size 16
+python src/main.py --config_path src/configs/sample_config.json --learning_rate 5e-5 --batch_size 16
 ```
 
 ## Memory Management with Accelerate
@@ -52,7 +52,7 @@ The framework uses Accelerate primarily for its auto device mapping functionalit
 ### Using Accelerate Device Mapping
 
 ```bash
-python src/main.py --train --use_accelerate --config_path src/configs/sample_config.json
+python src/main.py --use_accelerate --config_path src/configs/sample_config.json
 ```
 
 ### Command-line Arguments for Memory Management
@@ -240,7 +240,7 @@ The codebase includes a specialized `TemplatePolicy` that generates multiple tem
 The `TemplatePolicy` extends `TransformerPolicy` to add template handling:
 
 ```python
-from policies import TemplatePolicy
+from src.policies.low_level import TemplatePolicy
 
 policy = TemplatePolicy(
     model_name="meta-llama/Llama-3.2-1B-Instruct",
@@ -294,7 +294,7 @@ This approach ensures that both chosen and unchosen branches contribute to polic
 To run the template policy example:
 
 ```
-python src/template_policy_example.py --checkpoint "meta-llama/Llama-3.2-1B-Instruct" --train --debug
+python src/template_policy_example.py --checkpoint "meta-llama/Llama-3.2-1B-Instruct" --debug
 ```
 
 This will demonstrate template generation, branch tracking, and branch-aware GAE calculation in action.
