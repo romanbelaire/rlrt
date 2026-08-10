@@ -24,13 +24,9 @@ The configuration system uses a hierarchical structure with several components:
 
 ## Parameter Consolidation Notes
 
-### `data_path` vs `dataset_path`
+### `data_path`
 
-As of the latest update, we have consolidated these parameters to use `data_path` consistently throughout the codebase:
-
-- **`data_path`** is now the standardized parameter name in all configuration files and code
-- For backward compatibility, `dataset_path` will still work in configuration files, but will be mapped to `data_path` internally
-- A warning message will be displayed when `dataset_path` is used instead of `data_path`
+The configuration system uses `data_path` to specify the dataset directory or file path for training data.
 
 ### Recommended Usage
 
@@ -45,7 +41,7 @@ In configuration files:
 
 In command line arguments:
 ```bash
-python src/main.py --train --data_dir HarmBench
+python src/main.py --data_dir HarmBench
 ```
 
 ## Using HarmBench CSV Files
@@ -54,17 +50,17 @@ To use the HarmBench CSV files for training:
 
 1. Use the provided configuration file:
    ```bash
-   python src/main.py --train --config_path configs/harmbench_config.json
+   python src/main.py --config_path configs/harmbench_config.json
    ```
 
 2. Or specify the data directory directly:
    ```bash
-   python src/main.py --train --data_dir HarmBench
+   python src/main.py --data_dir HarmBench
    ```
 
 3. Or point to a specific CSV file:
    ```bash
-   python src/main.py --train --data_dir HarmBench/harmbench_behaviors_text_all.csv
+   python src/main.py --data_dir HarmBench/harmbench_behaviors_text_all.csv
    ```
 
 The environment will automatically detect CSV files and load them appropriately, using the "Behavior" column for questions when available. 

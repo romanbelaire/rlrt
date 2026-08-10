@@ -236,13 +236,13 @@ train_agent(config)
 ### Command Line Training
 
 ```bash
-python src/main.py --train --config_path config.json
+python src/main.py --config_path config.json
 ```
 
 ### Hierarchical Training
 
 ```bash
-python src/main.py --train --config_path config.json \
+python src/main.py --config_path config.json \
     --use_high_level_policy \
     --high_level_policy_type ppo
 ```

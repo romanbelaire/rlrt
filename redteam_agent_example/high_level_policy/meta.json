@@ -1,0 +1,8 @@
+{
+  "policy_type": "freeform",
+  "class": "FreeformHighLevelPolicy",
+  "max_new_tokens": 48,
+  "temperature": 0.8,
+  "top_p": 0.9,
+  "use_response_tags": true
+}

@@ -1,5 +1,13 @@
 # Documentation
 
+## Recent Fixes
+
+### Oracle Response Parsing Fix
+- **File**: `docs/ORACLE_RESPONSE_PARSING_FIX.md`
+- **Issue**: Oracle responses like "Yes." and "No." were not being correctly parsed, causing evaluation accuracy to show 0% even when the oracle was answering correctly.
+- **Solution**: Enhanced punctuation handling in response parsing to ensure oracle responses are properly recognized.
+- **Impact**: Evaluation metrics now accurately reflect oracle performance.
+
 ## agent.py
 
 ### Overview

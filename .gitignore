@@ -10,7 +10,7 @@ __pycache__/
 .env.test.local/
 .env.production.local/
 build/
-models/
+# Local HF/base model caches (trained release checkpoints live in models/ and are tracked via LFS)
 llm/
 experiments/
 output/
@@ -38,3 +38,4 @@ deprecated/
 conversations/
 outputs/
 results/
+*api*
